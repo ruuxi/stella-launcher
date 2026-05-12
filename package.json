@@ -1,6 +1,6 @@
 {
 	"name": "stella-launcher",
-	"version": "0.0.50",
+	"version": "0.0.131",
 	"private": true,
 	"scripts": {
 		"dev": "tauri dev",
