@@ -33,19 +33,20 @@ const updateJsonVersion = (relativePath, indent) => {
 const updateCargoTomlVersion = (relativePath) => {
   const absolutePath = path.join(launcherDir, relativePath)
   const existing = readFileSync(absolutePath, 'utf8')
-  const next = existing.replace(
-    /^version = ".*"$/m,
-    `version = "${normalizedVersion}"`,
-  )
+  const versionPattern = /^version = ".*"$/m
 
-  if (next === existing) {
+  if (!versionPattern.test(existing)) {
     console.error(
       `[launcher:stamp-version] Could not find version field in ${relativePath}.`,
     )
     process.exit(1)
   }
 
-  writeFileSync(absolutePath, next, 'utf8')
+  const next = existing.replace(versionPattern, `version = "${normalizedVersion}"`)
+
+  if (next !== existing) {
+    writeFileSync(absolutePath, next, 'utf8')
+  }
 }
 
 updateJsonVersion('package.json', '\t')
