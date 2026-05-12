@@ -99,6 +99,10 @@ pub struct LauncherUpdateInfo {
     pub available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Version embedded in the running launcher binary at build time
+    /// (Cargo `package.version`). Surfaced in Settings → Updates so the
+    /// user can see what they're on at a glance.
+    pub current_version: String,
     pub checking: bool,
     pub installing: bool,
     pub last_checked_at_ms: u64,

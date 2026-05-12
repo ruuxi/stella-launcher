@@ -7,7 +7,12 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { DesktopFailure, InstallerState, SetupStep } from "./types";
+import type {
+  DesktopFailure,
+  InstallerState,
+  LauncherUpdateInfo,
+  SetupStep,
+} from "./types";
 import stellaLogo from "./stella-logo.svg";
 
 const formatBytes = (bytes: number | null): string => {
@@ -257,6 +262,25 @@ function App() {
     try {
       await invoke("apply_launcher_update");
     } catch {}
+  }, []);
+
+  const [updateCheckError, setUpdateCheckError] = useState<string | null>(null);
+  const [updateCheckedAtMs, setUpdateCheckedAtMs] = useState(0);
+  const handleCheckForUpdate = useCallback(async () => {
+    setUpdateCheckError(null);
+    try {
+      await invoke<boolean>("check_launcher_update");
+    } catch (err) {
+      setUpdateCheckError(
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Couldn't check for updates.",
+      );
+    } finally {
+      setUpdateCheckedAtMs(Date.now());
+    }
   }, []);
 
   const handleReinstall = useCallback(async () => {
@@ -660,6 +684,14 @@ function App() {
           </div>
 
           <div className="settings-list">
+            <UpdatesRow
+              info={state.launcherUpdate}
+              checkError={updateCheckError}
+              checkedAtMs={updateCheckedAtMs}
+              onCheck={handleCheckForUpdate}
+              onInstall={handleLauncherUpdate}
+              disabled={anyDialogBusy}
+            />
             <SettingsRow
               title="Reinstall"
               body="Replace Stella with a fresh copy. Your chats and memories stay; Stella's customizations reset."
@@ -1057,6 +1089,67 @@ const SettingsRow = ({
         )}
       </button>
     </div>
+  );
+};
+
+/* ── Updates row ─────────────────────────────────────────────────── */
+
+const UPDATE_THROTTLE_MS = 10_000;
+
+type UpdatesRowProps = {
+  info: LauncherUpdateInfo;
+  checkError: string | null;
+  checkedAtMs: number;
+  onCheck: () => void;
+  onInstall: () => void;
+  disabled: boolean;
+};
+
+const UpdatesRow = ({
+  info,
+  checkError,
+  checkedAtMs,
+  onCheck,
+  onInstall,
+  disabled,
+}: UpdatesRowProps) => {
+  // Force a re-render when the throttle window expires so the button
+  // re-enables without needing user interaction.
+  const [, force] = useState(0);
+  const elapsed = checkedAtMs > 0 ? Date.now() - checkedAtMs : Infinity;
+  const throttled = elapsed < UPDATE_THROTTLE_MS;
+  useEffect(() => {
+    if (!throttled) return;
+    const remaining = UPDATE_THROTTLE_MS - elapsed;
+    const t = setTimeout(() => force((n) => n + 1), remaining + 50);
+    return () => clearTimeout(t);
+  }, [throttled, elapsed]);
+
+  const updateAvailable = info.available && !!info.version;
+  const body = info.installing
+    ? "Installing the latest launcher..."
+    : info.checking
+      ? "Checking for the latest launcher..."
+      : info.error
+        ? info.error
+        : checkError
+          ? checkError
+          : updateAvailable
+            ? `Version ${info.version} is ready to install. You're on ${info.currentVersion}.`
+            : checkedAtMs > 0
+              ? `You're on version ${info.currentVersion}. Up to date.`
+              : `You're on version ${info.currentVersion}.`;
+
+  return (
+    <SettingsRow
+      title="Updates"
+      body={body}
+      actionLabel={updateAvailable ? "Install update" : "Check for updates"}
+      onAction={updateAvailable ? onInstall : onCheck}
+      busy={info.checking || info.installing}
+      busyLabel={info.installing ? "Installing..." : "Checking..."}
+      disabled={disabled || throttled}
+    />
   );
 };
 

@@ -93,6 +93,11 @@ fn schedule_launcher_update_check(app: tauri::AppHandle) {
     });
 }
 
+/// Minimum gap between user-initiated update checks. The background
+/// poller (every 4h) is exempt; this just keeps the Settings button
+/// from spamming R2 if a user mashes it.
+const MANUAL_LAUNCHER_UPDATE_THROTTLE_MS: u64 = 10_000;
+
 pub async fn check_for_launcher_update(
     app: &tauri::AppHandle,
     surface_errors: bool,
@@ -103,6 +108,23 @@ pub async fn check_for_launcher_update(
 
     {
         let mut installer = app_state.installer.lock().await;
+        if installer.launcher_update.checking {
+            return Err("A launcher update check is already in progress.".into());
+        }
+        if surface_errors && installer.launcher_update.last_checked_at_ms > 0 {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let elapsed = now_ms.saturating_sub(installer.launcher_update.last_checked_at_ms);
+            if elapsed < MANUAL_LAUNCHER_UPDATE_THROTTLE_MS {
+                let wait_secs =
+                    ((MANUAL_LAUNCHER_UPDATE_THROTTLE_MS - elapsed) + 999) / 1000;
+                return Err(format!(
+                    "Please wait {wait_secs}s before checking again."
+                ));
+            }
+        }
         installer.launcher_update.checking = true;
         if surface_errors {
             installer.launcher_update.error = None;
