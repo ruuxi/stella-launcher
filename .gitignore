@@ -4,6 +4,7 @@ bun.lock
 
 # Tauri build output
 src-tauri/target/
+src-tauri/gen/
 
 # OS
 .DS_Store
