@@ -1,6 +1,6 @@
 [package]
 name = "stella-launcher"
-version = "0.0.1"
+version = "0.0.50"
 edition = "2021"
 
 [[bin]]
