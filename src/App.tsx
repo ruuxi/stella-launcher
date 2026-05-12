@@ -660,11 +660,14 @@ function App() {
     <div className={`shell${isComplete ? " shell--complete" : ""}`}>
       <div className="drag-region" />
 
-      {/* Brand header — always visible */}
-      <div className="brand">
-        <img src={stellaLogo} alt="Stella" className="brand-logo" />
-        <h1 className="brand-name">Stella</h1>
-      </div>
+      {/* Brand header — hidden in Settings (the back arrow + "Settings"
+          title carry the page already; brand is redundant there). */}
+      {!settingsOpen && (
+        <div className="brand">
+          <img src={stellaLogo} alt="Stella" className="brand-logo" />
+          <h1 className="brand-name">Stella</h1>
+        </div>
+      )}
 
       {/* Body */}
       {settingsOpen ? (
