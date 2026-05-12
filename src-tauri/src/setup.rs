@@ -1780,6 +1780,20 @@ fn schedule_git_repo_init(install_dir: String) {
     });
 }
 
+/// Remove `backend/` and `launcher/` directories left behind by
+/// pre-split installs. Both moved out of the desktop tarball into
+/// their own repos (`stella-backend`, `stella-launcher`); leaving the
+/// stale copies in the install dir confuses the install-update agent
+/// and bloats the working tree. Idempotent: missing dirs are a no-op.
+async fn prune_legacy_split_dirs(install_dir: &str) {
+    for legacy in ["backend", "launcher"] {
+        let path = Path::new(install_dir).join(legacy);
+        if path_exists(&path).await {
+            let _ = fs::remove_dir_all(&path).await;
+        }
+    }
+}
+
 // ── Logging ─────────────────────────────────────────────────────────
 
 async fn log_install(dir: &str, msg: &str) {
@@ -2085,7 +2099,10 @@ pub async fn create_initial_state(ctx: &InstallerContext) -> InstallerState {
         run_after_install: settings.run_after_install.unwrap_or(true),
         can_launch: false,
         installed: false,
-        launcher_update: LauncherUpdateInfo::default(),
+        launcher_update: LauncherUpdateInfo {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            ..LauncherUpdateInfo::default()
+        },
         disk: DiskInfo {
             required_bytes: ctx.required_bytes,
             available_bytes: None,
@@ -2255,6 +2272,8 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
     if !path_exists(&package_json_of(dir)).await {
         return None;
     }
+
+    prune_legacy_split_dirs(dir).await;
 
     let mut env = dugite_launch_env(dir);
     if let Ok(exe) = std::env::current_exe() {

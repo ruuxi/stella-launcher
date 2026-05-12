@@ -37,6 +37,8 @@ export type InstallerPhase =
 export type LauncherUpdateInfo = {
   available: boolean;
   version?: string;
+  /** Version embedded in the running launcher binary at build time. */
+  currentVersion: string;
   checking: boolean;
   installing: boolean;
   lastCheckedAtMs: number;
