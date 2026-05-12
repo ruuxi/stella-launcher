@@ -1,0 +1,14 @@
+node_modules/
+dist/
+bun.lock
+
+# Tauri build output
+src-tauri/target/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.tmp
