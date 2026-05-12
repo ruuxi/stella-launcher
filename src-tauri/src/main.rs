@@ -62,10 +62,17 @@ fn dev_path_override() -> Option<String> {
         return None;
     }
 
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    // Default to a sibling `stella` checkout (e.g.
+    // ~/projects/stella-launcher → ~/projects/stella). Previously this
+    // walked `..` `..` from `src-tauri/` to get stella's repo root, but
+    // stella-launcher is now its own repo so that walk lands in the
+    // parent projects/ directory. Override explicitly via
+    // `STELLA_LAUNCHER_DEV_PATH` if your stella checkout lives elsewhere.
+    let sibling_stella = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("..");
-    Some(repo_root.to_string_lossy().to_string())
+        .join("..")
+        .join("stella");
+    Some(sibling_stella.to_string_lossy().to_string())
 }
 
 fn schedule_launcher_update_check(app: tauri::AppHandle) {
