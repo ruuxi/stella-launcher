@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/tauri-v2-capability-schema/main/schema.json",
   "productName": "Stella",
-  "version": "0.0.132",
+  "version": "0.0.133",
   "identifier": "com.stella.launcher",
   "build": {
     "frontendDist": "../dist",
