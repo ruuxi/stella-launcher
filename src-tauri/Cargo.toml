@@ -17,7 +17,6 @@ tokio = { version = "1", features = ["process", "fs", "io-util"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json"], default-features = false }
 dirs = "6"
 fs2 = "0.4"
-open = "5"
 regex-lite = "0.1"
 tar = "0.4"
 zstd = "0.13"

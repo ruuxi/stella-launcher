@@ -758,6 +758,22 @@ pub async fn clear_desktop_failure(
 /// self-mod (no `Stella-Conversation:` trailer); in that case the
 /// renderer should hide the undo button and surface "Reinstall Stella"
 /// as the next step instead.
+/// Inspect the install repo and return a summary of the latest commit when
+/// it is an agent-authored self-mod (matches the same `Stella-Conversation:`
+/// trailer guard that `revert_last_self_mod` uses). Returns `Ok(None)` when
+/// there is nothing safe to roll back. Surfaced in the launcher's Settings
+/// page so the user can undo a bad self-mod even when nothing has crashed.
+#[tauri::command]
+pub async fn get_revertable_commit(
+    state: State<'_, AppState>,
+) -> Result<Option<RevertableCommit>, String> {
+    let install_path = {
+        let installer = state.installer.lock().await;
+        installer.install_path.clone()
+    };
+    Ok(latest_revertable_commit(&install_path))
+}
+
 #[tauri::command]
 pub async fn revert_last_self_mod(
     state: State<'_, AppState>,
@@ -880,18 +896,6 @@ pub async fn stop_desktop(state: State<'_, AppState>) -> Result<OkResult, String
 pub async fn is_desktop_running(state: State<'_, AppState>) -> Result<bool, String> {
     let installer = state.installer.lock().await;
     Ok(is_desktop_alive(&installer.install_path))
-}
-
-#[tauri::command]
-pub async fn open_install_location(state: State<'_, AppState>) -> Result<OkResult, String> {
-    let installer = state.installer.lock().await;
-    let path = installer.install_path.clone();
-    drop(installer);
-
-    match open::that(&path) {
-        Ok(_) => Ok(OkResult { ok: true }),
-        Err(_) => Ok(OkResult { ok: false }),
-    }
 }
 
 #[tauri::command]

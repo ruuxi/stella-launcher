@@ -11,6 +11,7 @@ import type {
   DesktopFailure,
   InstallerState,
   LauncherUpdateInfo,
+  RevertableCommit,
   SetupStep,
 } from "./types";
 import stellaLogo from "./stella-logo.svg";
@@ -120,7 +121,11 @@ const ConfirmDialog = ({
 
 /* ── App ─────────────────────────────────────────────────────────── */
 
-type SettingsAction = "reinstall" | "uninstall" | "full-reset";
+type SettingsAction =
+  | "reinstall"
+  | "uninstall"
+  | "full-reset"
+  | "undo-last-update";
 
 function App() {
   const [state, setState] = useState<InstallerState | null>(null);
@@ -130,7 +135,7 @@ function App() {
   const [reinstalling, setReinstalling] = useState(false);
   const [erasing, setErasing] = useState(false);
   const [desktopRunning, setDesktopRunning] = useState(false);
-  const [view, setView] = useState<"main" | "settings">("main");
+  const [view, setView] = useState<"main" | "settings" | "repair">("main");
   const [pendingAction, setPendingAction] = useState<SettingsAction | null>(
     null,
   );
@@ -141,6 +146,14 @@ function App() {
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [showFailureDetails, setShowFailureDetails] = useState(false);
   const [confirmingRevert, setConfirmingRevert] = useState(false);
+  // Latest agent-authored self-mod commit on the install repo, refreshed
+  // every time the user opens Settings. `undefined` = not loaded yet,
+  // `null` = checked and nothing safe to revert (hide the row).
+  const [revertable, setRevertable] = useState<RevertableCommit | null | undefined>(
+    undefined,
+  );
+  const [reverting, setReverting] = useState(false);
+  const [revertError, setRevertError] = useState<string | null>(null);
 
   const applyState = useCallback((nextState: InstallerState) => {
     startTransition(() => setState(nextState));
@@ -254,10 +267,6 @@ function App() {
     await invoke<{ ok: boolean }>("launch_desktop");
   }, []);
 
-  const handleOpenFolder = useCallback(async () => {
-    await invoke("open_install_location");
-  }, []);
-
   const handleLauncherUpdate = useCallback(async () => {
     try {
       await invoke("apply_launcher_update");
@@ -305,6 +314,42 @@ function App() {
       setView("main");
     }
   }, []);
+
+  // Refresh the latest revertable commit whenever the user opens Repair,
+  // and after an undo runs, so the page reflects the current HEAD.
+  const refreshRevertable = useCallback(async () => {
+    try {
+      const next = await invoke<RevertableCommit | null>("get_revertable_commit");
+      setRevertable(next ?? null);
+    } catch {
+      setRevertable(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (view !== "repair") return;
+    void refreshRevertable();
+  }, [view, refreshRevertable]);
+
+  const handleUndoLastUpdate = useCallback(async () => {
+    setReverting(true);
+    setRevertError(null);
+    try {
+      await invoke("revert_last_self_mod");
+      await refreshRevertable();
+    } catch (err) {
+      setRevertError(
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Couldn't roll back the last update.",
+      );
+    } finally {
+      setReverting(false);
+      setPendingAction(null);
+    }
+  }, [refreshRevertable]);
 
   const handleFullReset = useCallback(async () => {
     setErasing(true);
@@ -458,7 +503,9 @@ function App() {
   const showLauncherUpdateBusy =
     !state.devMode && state.launcherUpdate.installing;
   const settingsOpen = view === "settings" && !state.devMode;
-  const anyDialogBusy = uninstalling || reinstalling || erasing;
+  const repairOpen = view === "repair" && !state.devMode;
+  const sideViewOpen = settingsOpen || repairOpen;
+  const anyDialogBusy = uninstalling || reinstalling || erasing || reverting;
 
   const dialogStepsForAction = (
     action: SettingsAction,
@@ -520,6 +567,30 @@ function App() {
           busyLabel: "Erasing...",
           onConfirm: handleFullReset,
         };
+      case "undo-last-update": {
+        const subject = revertable?.subject ?? "";
+        return {
+          steps: [
+            {
+              title: "Undo Stella's last update?",
+              body: subject
+                ? `This rolls back "${subject}". Anything Stella changed in that update will be lost.`
+                : "This rolls back the most recent change Stella made to itself. Anything in that update will be lost.",
+              confirmLabel: "Continue",
+              danger: true,
+            },
+            {
+              title: "Last chance.",
+              body: "Once you undo, Stella can't bring this update back. Your chats, memories, and settings are kept either way.",
+              confirmLabel: "Undo update",
+              danger: true,
+            },
+          ],
+          busy: reverting,
+          busyLabel: "Undoing...",
+          onConfirm: handleUndoLastUpdate,
+        };
+      }
     }
   };
 
@@ -660,9 +731,9 @@ function App() {
     <div className={`shell${isComplete ? " shell--complete" : ""}`}>
       <div className="drag-region" />
 
-      {/* Brand header — hidden in Settings (the back arrow + "Settings"
+      {/* Brand header — hidden inside Settings / Repair (their back arrow +
           title carry the page already; brand is redundant there). */}
-      {!settingsOpen && (
+      {!sideViewOpen && (
         <div className="brand">
           <img src={stellaLogo} alt="Stella" className="brand-logo" />
           <h1 className="brand-name">Stella</h1>
@@ -670,7 +741,58 @@ function App() {
       )}
 
       {/* Body */}
-      {settingsOpen ? (
+      {repairOpen ? (
+        <main className="body settings-view" key="repair">
+          <div className="settings-header">
+            <button
+              type="button"
+              className="link-btn settings-back"
+              onClick={() => {
+                setPendingAction(null);
+                setRevertError(null);
+                setView("main");
+              }}
+            >
+              ← Back
+            </button>
+            <span className="settings-title">Repair</span>
+          </div>
+
+          <div className="settings-list">
+            {revertable === undefined ? (
+              <p className="repair-status">Checking the latest update…</p>
+            ) : revertable ? (
+              <>
+                <SettingsRow
+                  title="Undo Stella's last update"
+                  body={
+                    revertable.subject
+                      ? `Roll back "${revertable.subject}". Anything Stella changed in that update will be lost. Your chats, memories, and settings are kept.`
+                      : "Roll back the most recent change Stella made to itself. Anything in that update will be lost. Your chats, memories, and settings are kept."
+                  }
+                  actionLabel="Undo update"
+                  onAction={() => setPendingAction("undo-last-update")}
+                  busy={reverting}
+                  busyLabel="Undoing..."
+                  danger
+                  disabled={anyDialogBusy && !reverting}
+                />
+                {revertError && (
+                  <p className="repair-status repair-status--error">
+                    {revertError}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="repair-status">
+                Nothing to undo right now. The latest change isn't a Stella
+                self-update, so it can't be rolled back automatically. If
+                something is broken, try Reinstall from Settings.
+              </p>
+            )}
+          </div>
+        </main>
+      ) : settingsOpen ? (
         <main className="body settings-view" key="settings">
           <div className="settings-header">
             <button
@@ -950,7 +1072,7 @@ function App() {
       )}
 
       {/* Footer */}
-      {!settingsOpen && (
+      {!sideViewOpen && (
         <footer className="footer">
           <div className="footer-primary" key={`primary-${state.phase}`}>
             {isSetup && !state.devMode && (
@@ -1009,14 +1131,17 @@ function App() {
 
           {!state.devMode && !isWorking && (
             <div className="footer-links">
-              {isComplete && (
+              {isComplete && state.installed && (
                 <button
                   type="button"
                   className="link-btn"
-                  onClick={() => void handleOpenFolder()}
+                  onClick={() => {
+                    setRevertError(null);
+                    setView("repair");
+                  }}
                   disabled={anyDialogBusy}
                 >
-                  Open folder
+                  Repair
                 </button>
               )}
               {isComplete && state.installed && !desktopRunning && (

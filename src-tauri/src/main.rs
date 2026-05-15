@@ -286,12 +286,12 @@ fn main() {
             commands::show_launcher_window,
             commands::stop_desktop,
             commands::is_desktop_running,
-            commands::open_install_location,
             commands::uninstall_stella,
             commands::full_reset_stella,
             commands::get_desktop_failure,
             commands::clear_desktop_failure,
             commands::revert_last_self_mod,
+            commands::get_revertable_commit,
         ])
         .on_window_event(|_window, _event| {})
         .run(tauri::generate_context!())
