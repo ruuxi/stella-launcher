@@ -462,6 +462,42 @@ async fn path_exists_str(p: &str) -> bool {
     path_exists(Path::new(p)).await
 }
 
+async fn valid_install_manifest_exists(install_dir: &str) -> bool {
+    let manifest_path = manifest_of(install_dir);
+    let Ok(raw) = fs::read_to_string(&manifest_path).await else {
+        return false;
+    };
+    serde_json::from_str::<Manifest>(&raw).is_ok()
+}
+
+async fn write_install_manifest_atomic(
+    manifest_path: &Path,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| format!("Failed to serialize install manifest: {e}"))?;
+    let _: Manifest = serde_json::from_str(&json)
+        .map_err(|e| format!("Serialized install manifest was invalid: {e}"))?;
+    let tmp_path = manifest_path.with_file_name(format!(
+        ".{}.{}.tmp",
+        manifest_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(INSTALL_MANIFEST),
+        std::process::id()
+    ));
+    fs::write(&tmp_path, json)
+        .await
+        .map_err(|e| format!("Failed to write temporary install manifest: {e}"))?;
+    match fs::rename(&tmp_path, manifest_path).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path).await;
+            Err(format!("Failed to persist install manifest: {e}"))
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDownloadManifest {
@@ -1767,11 +1803,7 @@ async fn update_manifest_install_base_commit(install_dir: &str, sha: &str) -> Re
     let mut manifest: Manifest = serde_json::from_str(&raw)
         .map_err(|e| format!("Install manifest was invalid JSON: {e}"))?;
     manifest.desktop_install_base_commit = Some(sha.to_string());
-    let json = serde_json::to_string_pretty(&manifest)
-        .map_err(|e| format!("Failed to serialize install manifest: {e}"))?;
-    fs::write(&manifest_path, json)
-        .await
-        .map_err(|e| format!("Failed to persist install manifest: {e}"))
+    write_install_manifest_atomic(&manifest_path, &manifest).await
 }
 
 fn schedule_git_repo_init(install_dir: String) {
@@ -1859,7 +1891,7 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> bool {
             if state.dev_mode {
                 true
             } else {
-                path_exists(&manifest_of(dir)).await
+                valid_install_manifest_exists(dir).await
             }
         }
         _ => true,
@@ -1983,10 +2015,7 @@ async fn install_step(
                 shortcuts: HashMap::new(),
             };
 
-            let json = serde_json::to_string_pretty(&manifest).unwrap_or_default();
-            fs::write(manifest_of(&dir), json)
-                .await
-                .map_err(|e| format!("Failed to write manifest: {e}"))?;
+            write_install_manifest_atomic(&manifest_of(&dir), &manifest).await?;
 
             schedule_git_repo_init(dir.clone());
 
@@ -2030,7 +2059,7 @@ async fn refresh_derived(state: &mut InstallerState, ctx: &InstallerContext) {
 
     state.install_path_error = location_error(&state.install_path);
 
-    let has_manifest = path_exists(&manifest_of(&state.install_path)).await;
+    let has_manifest = valid_install_manifest_exists(&state.install_path).await;
     let has_payload = payload_step_complete(&state.install_path).await;
     let has_native_helpers = native_helpers_step_complete(&state.install_path).await;
     state.can_launch = if state.dev_mode {
