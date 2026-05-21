@@ -378,45 +378,14 @@ body {
 
 /* ── Update pill (non-forced launcher update affordance) ───────── */
 
-.update-pill {
-	display: inline-flex;
-	align-items: center;
-	gap: 8px;
+.update-link {
 	align-self: center;
-	background: color-mix(in oklab, var(--accent) 10%, transparent);
-	border: 1px solid color-mix(in oklab, var(--accent) 35%, transparent);
-	color: var(--accent-hover);
-	border-radius: 999px;
-	padding: 6px 14px;
-	font-family: var(--font);
-	font-size: 12px;
-	font-weight: 500;
-	cursor: pointer;
-	transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+	color: var(--text-dim);
 	animation: fadeIn 0.2s ease;
 }
 
-.update-pill:hover:not(:disabled) {
-	background: color-mix(in oklab, var(--accent) 18%, transparent);
-	border-color: color-mix(in oklab, var(--accent) 55%, transparent);
-}
-
-.update-pill:disabled {
-	opacity: 0.5;
-	cursor: not-allowed;
-}
-
-.update-pill-dot {
-	width: 6px;
-	height: 6px;
-	border-radius: 50%;
-	background: var(--accent);
-	box-shadow: 0 0 6px color-mix(in oklab, var(--accent) 60%, transparent);
-	flex-shrink: 0;
-}
-
-.update-pill-text {
-	white-space: nowrap;
+.update-link:hover:not(:disabled) {
+	color: var(--accent);
 }
 
 /* ── Checkbox ─────────────────────────────────────────────────────── */

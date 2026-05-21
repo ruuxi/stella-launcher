@@ -1114,18 +1114,16 @@ function App() {
           {!state.devMode && !isWorking && updateAvailable && (
             <button
               type="button"
-              className="update-pill"
+              className="link-btn link-btn--with-spinner update-link"
               onClick={() => void handleLauncherUpdate()}
               disabled={showLauncherUpdateBusy || anyDialogBusy}
             >
-              <span className="update-pill-dot" aria-hidden="true" />
-              <span className="update-pill-text">
-                {showLauncherUpdateBusy
-                  ? "Updating launcher..."
-                  : state.launcherUpdate.version
-                    ? `Launcher ${state.launcherUpdate.version} ready · Update`
-                    : "Launcher update ready · Update"}
-              </span>
+              {showLauncherUpdateBusy && <span className="link-spinner" />}
+              {showLauncherUpdateBusy
+                ? "Updating launcher…"
+                : state.launcherUpdate.version
+                  ? `Update launcher to ${state.launcherUpdate.version}`
+                  : "Update launcher"}
             </button>
           )}
 
@@ -1276,7 +1274,7 @@ const UpdatesRow = ({
       onAction={updateAvailable ? onInstall : onCheck}
       busy={info.checking || info.installing}
       busyLabel={info.installing ? "Installing..." : "Checking..."}
-      disabled={disabled || throttled}
+      disabled={disabled || (throttled && !updateAvailable)}
     />
   );
 };
