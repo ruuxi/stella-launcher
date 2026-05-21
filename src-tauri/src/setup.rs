@@ -1674,17 +1674,16 @@ async fn read_release_manifest(install_dir: &str) -> Result<DesktopReleaseManife
 /// history attached**. The flow is:
 ///
 /// 1. `git init` + add `origin` pointing at the public Stella repo.
-/// 2. `git fetch --filter=blob:none origin <installCommit>` — pulls every
-///    commit's metadata back to the root, but skips file blobs (they get
-///    lazy-fetched on demand by `git show`/`git diff`). Typically <30 MB.
+/// 2. `git fetch --filter=blob:none origin <installCommit>` — pulls history
+///    and trees into the local repo without downloading every historical blob.
 /// 3. `git reset --mixed <installCommit>` — moves HEAD to the real upstream
 ///    SHA the tarball was built from. The working tree (already on disk
 ///    from the tarball) matches that commit byte-for-byte because the
 ///    release workflow now uses `git archive HEAD` to produce it, modulo
-///    the synthetic `stella-release.json`.
-/// 4. `git add -A && git commit --allow-empty -m "Stella install baseline"`
-///    — captures the synthetic file (and any tiny tarball-vs-commit drift)
-///    as the user's first local commit on top of upstream history.
+///    ignored launcher-local files like `stella-release.json`.
+/// 4. If there is tracked tarball-vs-commit drift, create a local baseline
+///    commit. The normal clean path leaves HEAD directly on the upstream
+///    release commit.
 ///
 /// The result is a local repo with full upstream history where self-mod
 /// commits accrue on top of a real upstream SHA — so the install-update
@@ -1692,10 +1691,6 @@ async fn read_release_manifest(install_dir: &str) -> Result<DesktopReleaseManife
 /// three-way merge work properly.
 async fn init_git_repo(install_dir: &str) {
     let git_dir = Path::new(install_dir).join(".git");
-    if path_exists(&git_dir).await {
-        return; // Already has a git repo
-    }
-
     let git_bin = dugite_git_bin_of(install_dir);
     if !path_exists(&git_bin).await {
         return;
@@ -1722,21 +1717,57 @@ async fn init_git_repo(install_dir: &str) {
     };
 
     let _ = run_git(vec!["--version".into()]).await;
-    let _ = run_git(vec!["init".into()]).await;
-    let _ = run_git(vec![
-        "remote".into(),
-        "add".into(),
-        "origin".into(),
-        STELLA_GITHUB_REMOTE_URL.into(),
-    ])
-    .await;
+    if path_exists(&git_dir).await {
+        let head_ok = run_git(vec![
+            "rev-parse".into(),
+            "--verify".into(),
+            "HEAD^{commit}".into(),
+        ])
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+        if head_ok {
+            return; // Already has a usable git repo.
+        }
+        let _ = fs::remove_file(git_dir.join("index.lock")).await;
+        log_install(
+            install_dir,
+            "Repairing incomplete git repository before launch.",
+        )
+        .await;
+    } else {
+        let _ = run_git(vec!["init".into()]).await;
+    }
 
-    let baseline_message = match &install_commit {
+    let remote_ok = run_git(vec![
+        "config".into(),
+        "--get".into(),
+        "remote.origin.url".into(),
+    ])
+    .await
+    .map(|output| output.status.success())
+    .unwrap_or(false);
+    if remote_ok {
+        let _ = run_git(vec![
+            "remote".into(),
+            "set-url".into(),
+            "origin".into(),
+            STELLA_GITHUB_REMOTE_URL.into(),
+        ])
+        .await;
+    } else {
+        let _ = run_git(vec![
+            "remote".into(),
+            "add".into(),
+            "origin".into(),
+            STELLA_GITHUB_REMOTE_URL.into(),
+        ])
+        .await;
+    }
+
+    let mut baseline_message: Option<&str> = None;
+    let fetched_release_history = match &install_commit {
         Some(commit) if !commit.is_empty() => {
-            // Lazy partial fetch: pull all commit/tree metadata back to root
-            // for the tarball's commit, but skip file blobs (loaded on
-            // demand by `git show`/`git diff` when the install-update agent
-            // actually inspects them).
             let fetch_result = run_git(vec![
                 "fetch".into(),
                 "--filter=blob:none".into(),
@@ -1752,44 +1783,85 @@ async fn init_git_repo(install_dir: &str) {
                 .unwrap_or(false);
 
             if fetched_ok {
+                let current_branch =
+                    run_git(vec!["symbolic-ref".into(), "--short".into(), "HEAD".into()])
+                        .await
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                        .filter(|branch| !branch.is_empty())
+                        .unwrap_or_else(|| "master".to_string());
+                let _ = run_git(vec![
+                    "update-ref".into(),
+                    format!("refs/heads/{current_branch}"),
+                    commit.clone(),
+                ])
+                .await;
                 // Move HEAD to the real upstream SHA without touching the
                 // working tree (which already has the upstream files from
                 // the tarball). `--mixed` updates the index, so any drift
                 // (e.g., the synthetic stella-release.json) shows as
                 // staged changes for the baseline commit below.
-                let _ = run_git(vec!["reset".into(), "--mixed".into(), commit.clone()]).await;
-                "Stella install baseline".to_string()
+                let _ = run_git(vec![
+                    "reset".into(),
+                    "--mixed".into(),
+                    "--no-refresh".into(),
+                    commit.clone(),
+                ])
+                .await;
+                true
             } else {
                 // Network problem at install time: fall back to a
                 // synthetic-root repo. The install-update agent will
                 // self-heal by fetching at update time.
-                "start".to_string()
+                baseline_message = Some("start");
+                false
             }
         }
-        _ => "start".to_string(),
+        _ => {
+            baseline_message = Some("start");
+            false
+        }
     };
 
     let _ = run_git(vec!["add".into(), "-A".into()]).await;
-    let _ = run_git(vec![
-        "-c".into(),
-        "user.name=Stella".into(),
-        "-c".into(),
-        "user.email=install@stella.local".into(),
-        "commit".into(),
-        "--allow-empty".into(),
-        "-m".into(),
-        baseline_message,
-    ])
-    .await;
+    let has_staged_changes = run_git(vec!["diff".into(), "--cached".into(), "--quiet".into()])
+        .await
+        .map(|output| !output.status.success())
+        .unwrap_or(true);
+    if fetched_release_history && has_staged_changes {
+        baseline_message = Some("Stella install baseline");
+    }
+
+    let mut wrote_baseline_commit = false;
+    if let Some(message) = baseline_message {
+        let commit_result = run_git(vec![
+            "-c".into(),
+            "user.name=Stella".into(),
+            "-c".into(),
+            "user.email=install@stella.local".into(),
+            "commit".into(),
+            "--allow-empty".into(),
+            "-m".into(),
+            message.into(),
+        ])
+        .await;
+        wrote_baseline_commit = commit_result
+            .as_ref()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+    }
 
     // Capture the local baseline commit SHA so the install-update agent
     // has a stable boundary marker between user-local commits and
     // upstream history (everything reachable from HEAD~1 is upstream).
-    if let Ok(output) = run_git(vec!["rev-parse".into(), "HEAD".into()]).await {
-        if output.status.success() {
-            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !sha.is_empty() {
-                let _ = update_manifest_install_base_commit(install_dir, &sha).await;
+    if wrote_baseline_commit {
+        if let Ok(output) = run_git(vec!["rev-parse".into(), "HEAD".into()]).await {
+            if output.status.success() {
+                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !sha.is_empty() {
+                    let _ = update_manifest_install_base_commit(install_dir, &sha).await;
+                }
             }
         }
     }
@@ -2303,6 +2375,7 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
     }
 
     prune_legacy_split_dirs(dir).await;
+    schedule_git_repo_init(dir.clone());
 
     let mut env = dugite_launch_env(dir);
     if let Ok(exe) = std::env::current_exe() {
