@@ -149,9 +149,9 @@ function App() {
   // Latest agent-authored self-mod commit on the install repo, refreshed
   // every time the user opens Settings. `undefined` = not loaded yet,
   // `null` = checked and nothing safe to revert (hide the row).
-  const [revertable, setRevertable] = useState<RevertableCommit | null | undefined>(
-    undefined,
-  );
+  const [revertable, setRevertable] = useState<
+    RevertableCommit | null | undefined
+  >(undefined);
   const [reverting, setReverting] = useState(false);
   const [revertError, setRevertError] = useState<string | null>(null);
 
@@ -319,7 +319,9 @@ function App() {
   // and after an undo runs, so the page reflects the current HEAD.
   const refreshRevertable = useCallback(async () => {
     try {
-      const next = await invoke<RevertableCommit | null>("get_revertable_commit");
+      const next = await invoke<RevertableCommit | null>(
+        "get_revertable_commit",
+      );
       setRevertable(next ?? null);
     } catch {
       setRevertable(null);
@@ -491,6 +493,10 @@ function App() {
     state.phase === "checking" ||
     state.phase === "updating";
   const isComplete = state.phase === "complete";
+  const incompleteSteps = state.steps.filter(
+    (step) =>
+      (step.status === "pending" || step.status === "error") && step.detail,
+  );
 
   const canInstall =
     isSetup &&
@@ -509,7 +515,12 @@ function App() {
 
   const dialogStepsForAction = (
     action: SettingsAction,
-  ): { steps: ConfirmStep[]; busy: boolean; busyLabel: string; onConfirm: () => Promise<void> } => {
+  ): {
+    steps: ConfirmStep[];
+    busy: boolean;
+    busyLabel: string;
+    onConfirm: () => Promise<void>;
+  } => {
     switch (action) {
       case "reinstall":
         return {
@@ -594,7 +605,9 @@ function App() {
     }
   };
 
-  const activeDialog = pendingAction ? dialogStepsForAction(pendingAction) : null;
+  const activeDialog = pendingAction
+    ? dialogStepsForAction(pendingAction)
+    : null;
 
   /* ── Recovery view ───────────────────────────────────────────── */
 
@@ -683,9 +696,7 @@ function App() {
               Settings → Reinstall.
             </p>
           )}
-          {recoveryError && (
-            <p className="recovery-error">{recoveryError}</p>
-          )}
+          {recoveryError && <p className="recovery-error">{recoveryError}</p>}
           <div className="recovery-details">
             <button
               type="button"
@@ -902,7 +913,9 @@ function App() {
 
                 <div className="field-meta">
                   {state.installPathError ? (
-                    <span className="field-error">{state.installPathError}</span>
+                    <span className="field-error">
+                      {state.installPathError}
+                    </span>
                   ) : (
                     <span className="field-hint">
                       {state.devMode
@@ -939,6 +952,20 @@ function App() {
 
               {state.errorMessage && !state.installPathError && (
                 <div className="banner banner-error">{state.errorMessage}</div>
+              )}
+
+              {incompleteSteps.length > 0 && (
+                <div className="banner banner-warn install-reasons">
+                  <span>Stella needs to finish:</span>
+                  <ul>
+                    {incompleteSteps.map((step) => (
+                      <li key={step.id}>
+                        <strong>{step.label}</strong>
+                        {step.detail ? `: ${step.detail}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
               )}
             </>
           )}
@@ -1035,9 +1062,12 @@ function App() {
                       )}
                     </span>
                     <span className="step-label">{step.label}</span>
-                    {step.detail && step.status === "installing" && (
-                      <span className="step-detail">{step.detail}</span>
-                    )}
+                    {step.detail &&
+                      (step.status === "installing" ||
+                        step.status === "pending" ||
+                        step.status === "error") && (
+                        <span className="step-detail">{step.detail}</span>
+                      )}
                   </li>
                 ))}
               </ul>

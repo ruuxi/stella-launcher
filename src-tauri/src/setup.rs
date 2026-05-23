@@ -1993,6 +1993,27 @@ struct StepDef {
     label: &'static str,
 }
 
+struct StepCheck {
+    complete: bool,
+    reason: Option<String>,
+}
+
+impl StepCheck {
+    fn complete() -> Self {
+        Self {
+            complete: true,
+            reason: None,
+        }
+    }
+
+    fn incomplete(reason: impl Into<String>) -> Self {
+        Self {
+            complete: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 fn build_step_defs() -> Vec<StepDef> {
     vec![
         StepDef {
@@ -2018,49 +2039,63 @@ fn build_step_defs() -> Vec<StepDef> {
     ]
 }
 
-async fn check_step(id: &SetupStepId, state: &InstallerState) -> bool {
+async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
     let dir = &state.install_path;
     match id {
-        SetupStepId::Runtime => bun_on_path().await,
-        SetupStepId::Payload => payload_step_complete(dir).await,
-        SetupStepId::NativeHelpers => native_helpers_step_complete(dir).await,
-        SetupStepId::Parakeet => parakeet_step_complete(dir).await,
-        SetupStepId::Finalize => {
-            if state.dev_mode {
-                true
+        SetupStepId::Runtime => {
+            if bun_on_path().await {
+                StepCheck::complete()
             } else {
-                valid_install_manifest_exists(dir).await
+                StepCheck::incomplete("Bun is not available yet.")
             }
         }
-        _ => true,
+        SetupStepId::Payload => payload_step_check(dir).await,
+        SetupStepId::NativeHelpers => native_helpers_step_check(dir).await,
+        SetupStepId::Parakeet => parakeet_step_check(dir).await,
+        SetupStepId::Finalize => {
+            if state.dev_mode || valid_install_manifest_exists(dir).await {
+                StepCheck::complete()
+            } else {
+                StepCheck::incomplete("Stella's install record is missing or invalid.")
+            }
+        }
+        _ => StepCheck::complete(),
     }
 }
 
 async fn payload_step_complete(dir: &str) -> bool {
+    payload_step_check(dir).await.complete
+}
+
+async fn payload_step_check(dir: &str) -> StepCheck {
     if !path_exists(&node_modules_of(dir)).await {
-        return false;
+        return StepCheck::incomplete("Desktop dependencies are missing.");
     }
     if !looks_like_stella_source_tree(Path::new(dir)) {
-        return false;
+        return StepCheck::incomplete("The selected folder is not a Stella desktop install.");
     }
     let Ok(manifest) = read_release_manifest(dir).await else {
-        return false;
+        return StepCheck::incomplete("Desktop release manifest is missing or invalid.");
     };
     if manifest.files.is_empty() {
-        return false;
+        return StepCheck::incomplete("Desktop release manifest has no file list.");
     }
     for relative_path in manifest.files.keys() {
         if !path_exists(&Path::new(dir).join(relative_path)).await {
-            return false;
+            return StepCheck::incomplete(format!("Desktop file is missing: {relative_path}"));
         }
     }
-    true
+    StepCheck::complete()
 }
 
 async fn native_helpers_step_complete(dir: &str) -> bool {
+    native_helpers_step_check(dir).await.complete
+}
+
+async fn native_helpers_step_check(dir: &str) -> StepCheck {
     let helpers_dir = native_helpers_dir_of(dir);
     if !path_exists(&helpers_dir).await {
-        return false;
+        return StepCheck::incomplete("Native helper folder is missing.");
     }
     // Sentinel: pick a binary that ships on every supported platform.
     let sentinel = if cfg!(target_os = "windows") {
@@ -2069,43 +2104,62 @@ async fn native_helpers_step_complete(dir: &str) -> bool {
         helpers_dir.join("window_info")
     };
     if !path_exists(&sentinel).await {
-        return false;
+        return StepCheck::incomplete("Native helper binary is missing.");
     }
 
     let Ok(release_manifest) = read_release_manifest(dir).await else {
-        return true;
+        return StepCheck::complete();
     };
     let expected_tag = release_manifest.tag;
     if !expected_tag.starts_with("desktop-v") {
-        return true;
+        return StepCheck::complete();
     }
 
     let install_manifest_path = native_helpers_install_manifest_of(dir);
     let Ok(raw) = fs::read_to_string(&install_manifest_path).await else {
         // Legacy installs did not write helper metadata. Keep them launchable;
         // desktop update/repair paths can refresh and add the manifest.
-        return true;
+        return StepCheck::complete();
     };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
+        return StepCheck::incomplete("Native helper install record is invalid.");
     };
-    parsed
+    if parsed
         .get("sha")
         .and_then(|value| value.as_str())
         .is_some_and(|sha| sha == expected_tag)
+    {
+        StepCheck::complete()
+    } else {
+        StepCheck::incomplete(format!("Native helpers do not match {expected_tag}."))
+    }
 }
 
+#[cfg(test)]
 async fn parakeet_step_complete(dir: &str) -> bool {
+    parakeet_step_check(dir).await.complete
+}
+
+async fn parakeet_step_check(dir: &str) -> StepCheck {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        return true;
+        return StepCheck::complete();
     }
     if !path_exists(&parakeet_helper_of(dir)).await {
         // Helper hasn't been delivered yet (payload + native helpers still to
         // run), so report not-complete to allow the parakeet step to run later.
-        return native_helpers_step_complete(dir).await && payload_step_complete(dir).await;
+        return if native_helpers_step_complete(dir).await && payload_step_complete(dir).await {
+            StepCheck::complete()
+        } else {
+            StepCheck::incomplete("Waiting for Stella and native helpers first.")
+        };
     }
-    path_exists(&parakeet_cache_dir_of(dir).join("FluidAudio")).await
+    if path_exists(&parakeet_cache_dir_of(dir).join("FluidAudio")).await
         || path_exists(&parakeet_cache_dir_of(dir).join("fluidaudio")).await
+    {
+        StepCheck::complete()
+    } else {
+        StepCheck::incomplete("Local dictation model is missing.")
+    }
 }
 
 async fn install_step(
@@ -2218,14 +2272,13 @@ async fn refresh_derived(state: &mut InstallerState, ctx: &InstallerContext) {
 
     state.install_path_error = location_error(&state.install_path);
 
-    let has_manifest = valid_install_manifest_exists(&state.install_path).await;
-    let has_payload = payload_step_complete(&state.install_path).await;
-    let has_native_helpers = native_helpers_step_complete(&state.install_path).await;
     state.can_launch = if state.dev_mode {
         looks_like_stella_source_tree(Path::new(&state.install_path))
             && path_exists(&node_modules_of(&state.install_path)).await
     } else {
-        has_manifest && has_payload && has_native_helpers
+        valid_install_manifest_exists(&state.install_path).await
+            && payload_step_complete(&state.install_path).await
+            && native_helpers_step_complete(&state.install_path).await
     };
     state.warning_message = None;
 }
@@ -2345,19 +2398,19 @@ pub async fn check_all(state: &mut InstallerState, ctx: &InstallerContext, app: 
     let mut all_done = true;
 
     for def in &defs {
-        let ok = check_step(&def.id, state).await;
+        let check = check_step(&def.id, state).await;
 
         if let Some(step) = state.steps.iter_mut().find(|s| s.id == def.id) {
-            step.status = if ok {
+            step.status = if check.complete {
                 SetupStepStatus::Skipped
             } else {
                 SetupStepStatus::Pending
             };
-            step.detail = None;
+            step.detail = check.reason;
             step.progress = None;
         }
 
-        if !ok {
+        if !check.complete {
             all_done = false;
         }
     }
@@ -2403,21 +2456,20 @@ pub async fn install_all(
     let defs = build_step_defs();
 
     for def in &defs {
-        let should_skip = state
-            .steps
-            .iter()
-            .find(|s| s.id == def.id)
-            .map_or(false, |s| {
-                s.status == SetupStepStatus::Skipped || s.status == SetupStepStatus::Done
-            });
-
-        if should_skip {
+        let check = check_step(&def.id, state).await;
+        if check.complete {
+            if let Some(step) = state.steps.iter_mut().find(|s| s.id == def.id) {
+                step.status = SetupStepStatus::Skipped;
+                step.detail = None;
+                step.progress = None;
+            }
+            emit_state_fast(state, app);
             continue;
         }
 
         if let Some(step) = state.steps.iter_mut().find(|s| s.id == def.id) {
             step.status = SetupStepStatus::Installing;
-            step.detail = Some(def.label.to_string());
+            step.detail = check.reason.or_else(|| Some(def.label.to_string()));
             step.progress = None;
         }
         emit_state_fast(state, app);
@@ -2579,6 +2631,18 @@ mod tests {
             format!(r#"{{"schemaVersion":1,"tag":"desktop-v0.0.1","files":{{{files_json}}}}}"#),
         )
         .expect("write release manifest");
+    }
+
+    fn write_native_helpers_shape(path: &Path) {
+        let install_dir = path.to_string_lossy();
+        let helpers_dir = native_helpers_dir_of(&install_dir);
+        fs::create_dir_all(&helpers_dir).expect("create native helpers dir");
+        let sentinel = if cfg!(target_os = "windows") {
+            helpers_dir.join("window_info.exe")
+        } else {
+            helpers_dir.join("window_info")
+        };
+        fs::write(sentinel, "").expect("write native helper sentinel");
     }
 
     fn write_generic_package_shape(path: &Path) {
@@ -2754,6 +2818,7 @@ mod tests {
         fs::write(dir.path.join("desktop").join("package.json"), "{}").expect("write desktop file");
         fs::write(dir.path.join("runtime").join("package.json"), "{}").expect("write runtime file");
         write_release_manifest(&dir.path, &["desktop/package.json", "runtime/package.json"]);
+        write_native_helpers_shape(&dir.path);
 
         let complete =
             tauri::async_runtime::block_on(parakeet_step_complete(&dir.path.to_string_lossy()));

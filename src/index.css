@@ -282,6 +282,24 @@ body {
 	animation: fadeIn 0.3s ease;
 }
 
+.install-reasons {
+	display: block;
+}
+
+.install-reasons span {
+	display: block;
+	margin-bottom: 6px;
+}
+
+.install-reasons ul {
+	margin: 0;
+	padding-left: 18px;
+}
+
+.install-reasons li + li {
+	margin-top: 4px;
+}
+
 @keyframes fadeIn {
 	from { opacity: 0; transform: translateY(4px); }
 	to { opacity: 1; transform: translateY(0); }
