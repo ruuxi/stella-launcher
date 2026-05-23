@@ -945,7 +945,7 @@ async fn ensure_electron_binary_installed(
     log_install(install_dir, "Preparing Electron binary").await;
 
     let result = run(
-        &["bun", "run", "electron:install"],
+        &["bun", "./node_modules/electron/install.js"],
         Some(Path::new(install_dir)),
     )
     .await;
@@ -962,7 +962,7 @@ async fn ensure_electron_binary_installed(
     };
     log_install(
         install_dir,
-        &format!("bun run electron:install failed\n{summary}"),
+        &format!("bun ./node_modules/electron/install.js failed\n{summary}"),
     )
     .await;
     Err(format!("Electron binary install failed: {summary}"))
