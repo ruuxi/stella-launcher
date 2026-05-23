@@ -29,6 +29,8 @@ const DEFAULT_DESKTOP_RELEASE_MANIFEST_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/desktop/current.json";
 const DEFAULT_NATIVE_HELPERS_MANIFEST_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/native-helpers/current.json";
+const DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL: &str =
+    "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/native-helpers";
 const INSTALL_DIR_NAME: &str = "stella";
 const ELECTRON_USER_DATA_DIR_NAME: &str = "electron-user-data";
 
@@ -522,6 +524,8 @@ struct NativeHelpersManifest {
     sha: Option<String>,
     #[serde(default)]
     commit: Option<String>,
+    #[serde(default)]
+    built_at: Option<String>,
     assets: HashMap<String, NativeHelpersAsset>,
 }
 
@@ -567,6 +571,36 @@ fn native_helpers_manifest_url() -> String {
         .unwrap_or_else(|| DEFAULT_NATIVE_HELPERS_MANIFEST_URL.to_string())
 }
 
+fn native_helpers_base_url() -> String {
+    std::env::var("STELLA_NATIVE_HELPERS_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL.to_string())
+}
+
+async fn native_helpers_manifest_url_for_install(install_dir: &str) -> String {
+    if std::env::var("STELLA_NATIVE_HELPERS_MANIFEST_URL")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return native_helpers_manifest_url();
+    }
+
+    if let Ok(release) = read_release_manifest(install_dir).await {
+        if release.tag.starts_with("desktop-v") {
+            return format!(
+                "{}/{}/manifest.json",
+                native_helpers_base_url(),
+                release.tag
+            );
+        }
+    }
+
+    native_helpers_manifest_url()
+}
+
 fn desktop_platform_key() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         "win-x64"
@@ -588,6 +622,9 @@ fn native_helpers_dir_of(install_dir: &str) -> PathBuf {
         .join("native")
         .join("out")
         .join(native_helpers_platform_dir())
+}
+fn native_helpers_install_manifest_of(install_dir: &str) -> PathBuf {
+    native_helpers_dir_of(install_dir).join(".stella-native-helpers.json")
 }
 
 fn normalize_sha256(value: &str) -> Option<String> {
@@ -1351,7 +1388,7 @@ async fn download_and_extract_native_helpers(
     app: &AppHandle,
 ) -> Result<(), String> {
     let platform = native_helpers_platform_key();
-    let manifest_url = native_helpers_manifest_url();
+    let manifest_url = native_helpers_manifest_url_for_install(install_dir).await;
     log_install(
         install_dir,
         &format!("Resolving native helpers manifest: {manifest_url}"),
@@ -1451,7 +1488,10 @@ async fn download_and_extract_native_helpers(
                     format_bytes_compact(total)
                 )
             } else {
-                format!("Downloading native helpers {}", format_bytes_compact(downloaded))
+                format!(
+                    "Downloading native helpers {}",
+                    format_bytes_compact(downloaded)
+                )
             };
             let progress = total_bytes
                 .filter(|total| *total > 0)
@@ -1480,6 +1520,7 @@ async fn download_and_extract_native_helpers(
     );
 
     let helpers_dir = native_helpers_dir_of(install_dir);
+    let install_manifest_path = native_helpers_install_manifest_of(install_dir);
     let helpers_dir_str = helpers_dir.to_string_lossy().to_string();
     let archive_path_for_extract = archive_path.clone();
     let extract_result = tokio::task::spawn_blocking(move || {
@@ -1535,6 +1576,31 @@ async fn download_and_extract_native_helpers(
     .and_then(|result| result);
     let _ = fs::remove_file(&archive_path).await;
     extract_result?;
+
+    let install_manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "sourceManifestUrl": manifest_url,
+        "platform": platform,
+        "helperPlatformDir": native_helpers_platform_dir(),
+        "sha": manifest.sha,
+        "commit": manifest.commit,
+        "builtAt": manifest.built_at,
+        "installedAt": chrono_now(),
+        "asset": {
+            "url": asset.url,
+            "sha256": asset.sha256,
+            "size": asset.size,
+        },
+    });
+    fs::write(
+        &install_manifest_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&install_manifest).unwrap_or_default()
+        ),
+    )
+    .await
+    .map_err(|e| format!("Failed to write native helpers install manifest: {e}"))?;
 
     log_install(install_dir, "Native helpers extracted").await;
     set_step_progress(
@@ -2002,7 +2068,31 @@ async fn native_helpers_step_complete(dir: &str) -> bool {
     } else {
         helpers_dir.join("window_info")
     };
-    path_exists(&sentinel).await
+    if !path_exists(&sentinel).await {
+        return false;
+    }
+
+    let Ok(release_manifest) = read_release_manifest(dir).await else {
+        return true;
+    };
+    let expected_tag = release_manifest.tag;
+    if !expected_tag.starts_with("desktop-v") {
+        return true;
+    }
+
+    let install_manifest_path = native_helpers_install_manifest_of(dir);
+    let Ok(raw) = fs::read_to_string(&install_manifest_path).await else {
+        // Legacy installs did not write helper metadata. Keep them launchable;
+        // desktop update/repair paths can refresh and add the manifest.
+        return true;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    parsed
+        .get("sha")
+        .and_then(|value| value.as_str())
+        .is_some_and(|sha| sha == expected_tag)
 }
 
 async fn parakeet_step_complete(dir: &str) -> bool {
@@ -2012,8 +2102,7 @@ async fn parakeet_step_complete(dir: &str) -> bool {
     if !path_exists(&parakeet_helper_of(dir)).await {
         // Helper hasn't been delivered yet (payload + native helpers still to
         // run), so report not-complete to allow the parakeet step to run later.
-        return native_helpers_step_complete(dir).await
-            && payload_step_complete(dir).await;
+        return native_helpers_step_complete(dir).await && payload_step_complete(dir).await;
     }
     path_exists(&parakeet_cache_dir_of(dir).join("FluidAudio")).await
         || path_exists(&parakeet_cache_dir_of(dir).join("fluidaudio")).await
@@ -2050,9 +2139,7 @@ async fn install_step(
             install_payload_dependencies(&dir, state, app).await?;
             Ok(())
         }
-        SetupStepId::NativeHelpers => {
-            download_and_extract_native_helpers(&dir, state, app).await
-        }
+        SetupStepId::NativeHelpers => download_and_extract_native_helpers(&dir, state, app).await,
         SetupStepId::Parakeet => {
             if let Err(err) = ensure_parakeet_model_downloaded(&dir).await {
                 let warning = format!(
