@@ -288,16 +288,17 @@ body {
 
 .install-reasons span {
 	display: block;
-	margin-bottom: 6px;
+	margin-bottom: 4px;
 }
 
 .install-reasons ul {
 	margin: 0;
-	padding-left: 18px;
+	padding: 0;
+	list-style: none;
 }
 
 .install-reasons li + li {
-	margin-top: 4px;
+	margin-top: 2px;
 }
 
 @keyframes fadeIn {
@@ -368,29 +369,27 @@ body {
 /* ── Banners ──────────────────────────────────────────────────────── */
 
 .banner {
-	padding: 8px 14px;
-	border-radius: 999px;
+	padding: 10px 14px;
+	border-radius: 10px;
+	border: 1px solid var(--border);
 	font-size: 12px;
 	margin-bottom: 12px;
 	text-align: center;
+	line-height: 1.5;
 }
 
 .banner-info {
-	background: color-mix(in oklab, var(--accent) 10%, transparent);
-	border: 1px solid color-mix(in oklab, var(--accent) 35%, transparent);
+	border-color: color-mix(in oklab, var(--accent) 35%, transparent);
 	color: var(--accent-hover);
 	animation: fadeIn 0.2s ease;
 }
 
 .banner-warn {
-	background: var(--surface);
-	border: 1px solid var(--border);
 	color: var(--text-dim);
 }
 
 .banner-error {
-	background: #fff0f0;
-	border: 1px solid #ffc0c0;
+	border-color: #ffc0c0;
 	color: var(--red);
 }
 
