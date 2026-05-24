@@ -306,7 +306,10 @@ function App() {
   const handleReinstall = useCallback(async () => {
     setReinstalling(true);
     try {
-      await invoke("uninstall_stella");
+      const uninstallResult = await invoke<{ ok: boolean }>("uninstall_stella");
+      if (!uninstallResult.ok) {
+        return;
+      }
       await invoke("start_install");
     } finally {
       setReinstalling(false);

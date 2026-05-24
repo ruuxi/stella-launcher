@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(target_os = "macos")]
@@ -19,6 +19,10 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const PID_FILE_NAME: &str = ".electron-dev-runner.pid";
+#[cfg(target_os = "windows")]
+const WINDOWS_PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "windows")]
+const WINDOWS_PROCESS_CLEANUP_POLL: Duration = Duration::from_millis(150);
 #[cfg(target_os = "macos")]
 const LAUNCHER_BUNDLE_ID: &str = "com.stella.launcher";
 
@@ -94,13 +98,133 @@ fn kill_pid_tree(pid: u32) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn install_path_prefix(install_path: &str) -> Option<String> {
+    let path = std::fs::canonicalize(install_path).unwrap_or_else(|_| PathBuf::from(install_path));
+    let mut value = path.to_string_lossy().replace('/', "\\");
+    while value.ends_with('\\') {
+        value.pop();
+    }
+    if value.len() <= 3 {
+        return None;
+    }
+    value.push('\\');
+    Some(value)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_install_process_pids(install_path: &str) -> Vec<u32> {
+    let Some(prefix) = install_path_prefix(install_path) else {
+        return Vec::new();
+    };
+    let root = prefix.trim_end_matches('\\').to_string();
+    let script = [
+        "$ErrorActionPreference = 'SilentlyContinue'".to_string(),
+        format!("$prefix = {}", powershell_single_quoted(&prefix)),
+        format!("$root = {}", powershell_single_quoted(&root)),
+        format!("$self = {}", std::process::id()),
+        "$scanner = $PID".to_string(),
+        "$matches = @()".to_string(),
+        "Get-CimInstance Win32_Process | ForEach-Object {".to_string(),
+        "  $processId = [int]$_.ProcessId".to_string(),
+        "  if ($processId -ne $self -and $processId -ne $scanner) {".to_string(),
+        "    $exe = [string]$_.ExecutablePath".to_string(),
+        "    $cmd = [string]$_.CommandLine".to_string(),
+        "    $exeMatches = $exe -and $exe.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)".to_string(),
+        "    $cmdMatches = $cmd -and $cmd.IndexOf($root, [System.StringComparison]::OrdinalIgnoreCase) -ge 0".to_string(),
+        "    if ($exeMatches -or $cmdMatches) { $matches += $processId }".to_string(),
+        "  }".to_string(),
+        "}".to_string(),
+        "$matches | Sort-Object -Unique | ConvertTo-Json -Compress".to_string(),
+    ]
+    .join("; ");
+
+    let output = StdCommand::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+        let values = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+        return values
+            .into_iter()
+            .filter_map(|value| value.as_u64().map(|pid| pid as u32))
+            .filter(|pid| *pid > 0 && *pid != std::process::id())
+            .collect();
+    }
+
+    raw.split_whitespace()
+        .filter_map(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 0 && *pid != std::process::id())
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn should_scan_install_processes(install_path: &str) -> bool {
+    let root = Path::new(install_path);
+    root.join("stella-install.json").is_file()
+        || root.join("stella-release.json").is_file()
+        || root.join("launch.cmd").is_file()
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_install_processes(install_path: &str) {
+    if !setup::is_uninstallable_install_path(install_path)
+        || !should_scan_install_processes(install_path)
+    {
+        return;
+    }
+
+    let mut pids = windows_install_process_pids(install_path);
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in &pids {
+        if is_pid_alive(*pid) {
+            kill_pid_tree(*pid);
+        }
+    }
+
+    let deadline = Instant::now() + WINDOWS_PROCESS_CLEANUP_TIMEOUT;
+    while Instant::now() < deadline {
+        let remaining = windows_install_process_pids(install_path)
+            .into_iter()
+            .any(is_pid_alive);
+        if !remaining {
+            break;
+        }
+        std::thread::sleep(WINDOWS_PROCESS_CLEANUP_POLL);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cleanup_install_processes(_install_path: &str) {}
+
 pub fn stop_desktop_by_path(install_path: &str) {
     if let Some(pid) = read_pid_file(install_path) {
         if is_pid_alive(pid) {
             kill_pid_tree(pid);
         }
-        let _ = std::fs::remove_file(desktop_pid_file(install_path));
     }
+    cleanup_install_processes(install_path);
+    let _ = std::fs::remove_file(desktop_pid_file(install_path));
 }
 
 /// Spawn a background tokio task that watches the desktop dev runner's pid
@@ -329,7 +453,7 @@ const STELLA_CONVERSATION_TRAILER: &str = "Stella-Conversation:";
 /// from "user quit" by exit code alone, so we fall back to "lifetime
 /// since reached-running" as the heuristic. Bootstrap failures
 /// (`reached_running == None`) are always treated as failures.
-const STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const STARTUP_GRACE: Duration = Duration::from_secs(5);
 
 /// Shared between the pid-file watcher and the child-exit waiter so the
 /// classifier knows whether bootstrap ever succeeded (pid file appeared)
@@ -922,6 +1046,7 @@ pub async fn uninstall_stella(
         return Ok(OkResult { ok: false });
     }
     let mut installer = state.installer.lock().await;
+    stop_desktop_by_path(&installer.install_path);
     let result = setup::uninstall(&mut installer).await;
 
     if result.is_ok() {
@@ -948,6 +1073,7 @@ pub async fn full_reset_stella(
         return Ok(OkResult { ok: false });
     }
     let mut installer = state.installer.lock().await;
+    stop_desktop_by_path(&installer.install_path);
     let result = setup::full_reset(&mut installer).await;
 
     if result.is_ok() {
