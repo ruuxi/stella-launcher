@@ -17,7 +17,9 @@ const RELEASE_MANIFEST: &str = "stella-release.json";
 const LAUNCH_SCRIPT_WIN: &str = "launch.cmd";
 const LAUNCH_SCRIPT_UNIX: &str = "launch.sh";
 const ENV_FILE_NAME: &str = ".env.local";
-const ESTIMATED_INSTALL_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+// Hydrated desktop payloads are roughly 3.7 GiB while the downloaded archive
+// and extracted app coexist. Keep headroom for filesystem metadata and caches.
+const ESTIMATED_INSTALL_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GB
 const DEFAULT_ENV_FILE_CONTENTS: &str = "\
 VITE_CONVEX_URL=https://benevolent-minnow-586.convex.cloud\n\
 VITE_CONVEX_SITE_URL=https://cloud.stella.sh\n\
@@ -910,6 +912,23 @@ async fn install_payload_dependencies(
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<(), String> {
+    if path_exists(&node_modules_of(install_dir)).await {
+        set_step_progress(
+            state,
+            app,
+            &SetupStepId::Payload,
+            "Using bundled dependencies",
+            Some(0.9),
+        );
+        log_install(
+            install_dir,
+            "Using bundled desktop dependencies from the release payload",
+        )
+        .await;
+        ensure_electron_binary_installed(install_dir, state, app).await?;
+        return Ok(());
+    }
+
     let dir = Some(Path::new(install_dir));
     let result = run_bun_install_with_progress(install_dir, dir, state, app).await;
     if result.ok {
@@ -963,6 +982,11 @@ async fn ensure_electron_binary_installed(
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<(), String> {
+    if path_exists(&electron_dist_dir_of(install_dir)).await {
+        log_install(install_dir, "Electron binary already bundled").await;
+        return Ok(());
+    }
+
     set_step_progress(
         state,
         app,
@@ -1415,6 +1439,17 @@ async fn download_and_extract_release(
         let mut archive = tar::Archive::new(decoder);
 
         std::fs::create_dir_all(&install_path).map_err(|e| format!("mkdir failed: {e}"))?;
+        for relative in ["node_modules", "desktop/native/out"] {
+            let target = Path::new(&install_path).join(relative);
+            if target.exists() {
+                let remove_result = if target.is_dir() {
+                    std::fs::remove_dir_all(&target)
+                } else {
+                    std::fs::remove_file(&target)
+                };
+                remove_result.map_err(|e| format!("remove stale {relative} failed: {e}"))?;
+            }
+        }
 
         for entry in archive
             .entries()
@@ -2149,6 +2184,9 @@ async fn payload_step_check(dir: &str) -> StepCheck {
     if !path_exists(&node_modules_of(dir)).await {
         return StepCheck::incomplete("Desktop dependencies are missing.");
     }
+    if !path_exists(&electron_dist_dir_of(dir)).await {
+        return StepCheck::incomplete("Electron binary is missing.");
+    }
     if !looks_like_stella_source_tree(Path::new(dir)) {
         return StepCheck::incomplete("The selected folder is not a Stella desktop install.");
     }
@@ -2713,6 +2751,11 @@ mod tests {
         fs::write(path.join("package.json"), r#"{"name":"stella"}"#).expect("write package");
     }
 
+    fn write_dependency_shape(path: &Path) {
+        fs::create_dir_all(path.join("node_modules").join("electron").join("dist"))
+            .expect("create bundled dependencies");
+    }
+
     fn write_release_manifest(path: &Path, files: &[&str]) {
         let files_json = files
             .iter()
@@ -2861,10 +2904,22 @@ mod tests {
     }
 
     #[test]
+    fn payload_completion_rejects_missing_electron_binary() {
+        let dir = TestDir::new("missing-electron");
+        write_install_shape(&dir.path);
+        fs::create_dir_all(dir.path.join("node_modules")).expect("create node_modules");
+
+        let check = tauri::async_runtime::block_on(payload_step_check(&dir.path.to_string_lossy()));
+
+        assert!(!check.complete);
+        assert_eq!(check.reason.as_deref(), Some("Electron binary is missing."));
+    }
+
+    #[test]
     fn payload_completion_rejects_missing_manifest_files() {
         let dir = TestDir::new("partial-payload");
         write_install_shape(&dir.path);
-        fs::create_dir_all(dir.path.join("node_modules")).expect("create node_modules");
+        write_dependency_shape(&dir.path);
         write_release_manifest(&dir.path, &["desktop/package.json", "runtime/missing.txt"]);
         fs::write(dir.path.join("desktop").join("package.json"), "{}").expect("write desktop file");
 
@@ -2878,7 +2933,7 @@ mod tests {
     fn payload_completion_accepts_manifest_files_and_dependencies() {
         let dir = TestDir::new("complete-payload");
         write_install_shape(&dir.path);
-        fs::create_dir_all(dir.path.join("node_modules")).expect("create node_modules");
+        write_dependency_shape(&dir.path);
         fs::write(dir.path.join("desktop").join("package.json"), "{}").expect("write desktop file");
         fs::write(dir.path.join("runtime").join("package.json"), "{}").expect("write runtime file");
         write_release_manifest(&dir.path, &["desktop/package.json", "runtime/package.json"]);
@@ -2907,7 +2962,7 @@ mod tests {
     fn parakeet_step_skips_missing_helper_after_payload_is_installed() {
         let dir = TestDir::new("parakeet-no-helper");
         write_install_shape(&dir.path);
-        fs::create_dir_all(dir.path.join("node_modules")).expect("create node_modules");
+        write_dependency_shape(&dir.path);
         fs::write(dir.path.join("desktop").join("package.json"), "{}").expect("write desktop file");
         fs::write(dir.path.join("runtime").join("package.json"), "{}").expect("write runtime file");
         write_release_manifest(&dir.path, &["desktop/package.json", "runtime/package.json"]);

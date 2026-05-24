@@ -16,19 +16,6 @@ import type {
 } from "./types";
 import stellaLogo from "./stella-logo.svg";
 
-const formatBytes = (bytes: number | null): string => {
-  if (bytes == null) return "unknown";
-  if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let i = 0;
-  while (value >= 1024 && i < units.length - 1) {
-    value /= 1024;
-    i++;
-  }
-  return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
-};
-
 /* ── In-app confirmation dialog ──────────────────────────────────── */
 
 type ConfirmStep = {
@@ -938,11 +925,12 @@ function App() {
                       {state.installPathError}
                     </span>
                   ) : (
-                    <span className="field-hint">
-                      {state.devMode
-                        ? "Dev mode is using the path from STELLA_LAUNCHER_DEV or STELLA_LAUNCHER_DEV_PATH."
-                        : `${formatBytes(state.disk.requiredBytes)} needed \u00b7 ${formatBytes(state.disk.availableBytes)} available`}
-                    </span>
+                    state.devMode && (
+                      <span className="field-hint">
+                        Dev mode is using the path from STELLA_LAUNCHER_DEV or
+                        STELLA_LAUNCHER_DEV_PATH.
+                      </span>
+                    )
                   )}
                   {!state.installPathLocked && (
                     <button
