@@ -268,6 +268,9 @@ fn package_json_of(d: &str) -> PathBuf {
 fn node_modules_of(d: &str) -> PathBuf {
     Path::new(d).join("node_modules")
 }
+fn electron_dist_dir_of(d: &str) -> PathBuf {
+    node_modules_of(d).join("electron").join("dist")
+}
 fn bun_executable_of() -> PathBuf {
     if cfg!(target_os = "windows") {
         home_dir().join(".bun").join("bin").join("bun.exe")
@@ -953,19 +956,69 @@ async fn ensure_electron_binary_installed(
         return Ok(());
     }
 
-    let summary = if !result.stderr.is_empty() {
-        result.stderr
-    } else if !result.stdout.is_empty() {
-        result.stdout
-    } else {
-        "Electron binary install failed.".into()
-    };
+    let summary = run_failure_summary(&result, "Electron binary install failed.");
     log_install(
         install_dir,
         &format!("bun ./node_modules/electron/install.js failed\n{summary}"),
     )
     .await;
-    Err(format!("Electron binary install failed: {summary}"))
+
+    let electron_dist_dir = electron_dist_dir_of(install_dir);
+    if path_exists(&electron_dist_dir).await {
+        log_install(
+            install_dir,
+            &format!(
+                "Removing incomplete Electron binary folder before retry: {}",
+                electron_dist_dir.display()
+            ),
+        )
+        .await;
+        if let Err(err) = fs::remove_dir_all(&electron_dist_dir).await {
+            log_install(
+                install_dir,
+                &format!("Failed to remove incomplete Electron binary folder: {err}"),
+            )
+            .await;
+            return Err(
+                "Stella could not repair the desktop app. Try installing again.".to_string(),
+            );
+        }
+    }
+
+    set_step_progress(
+        state,
+        app,
+        &SetupStepId::Payload,
+        "Preparing Electron",
+        Some(0.97),
+    );
+    let retry = run(
+        &["bun", "./node_modules/electron/install.js"],
+        Some(Path::new(install_dir)),
+    )
+    .await;
+    if retry.ok {
+        log_install(install_dir, "Electron binary prepared after repair").await;
+        return Ok(());
+    }
+
+    let retry_summary = run_failure_summary(&retry, "Electron binary install failed.");
+    log_install(
+        install_dir,
+        &format!("bun ./node_modules/electron/install.js retry failed\n{retry_summary}"),
+    )
+    .await;
+    Err("Stella could not prepare the desktop app. Try installing again.".to_string())
+}
+
+fn run_failure_summary(result: &crate::shell::RunResult, fallback: &str) -> String {
+    if !result.stderr.is_empty() {
+        result.stderr.clone()
+    } else if !result.stdout.is_empty() {
+        result.stdout.clone()
+    } else {
+        fallback.into()
+    }
 }
 
 async fn run_bun_install_with_progress(
@@ -2082,7 +2135,7 @@ async fn payload_step_check(dir: &str) -> StepCheck {
     }
     for relative_path in manifest.files.keys() {
         if !path_exists(&Path::new(dir).join(relative_path)).await {
-            return StepCheck::incomplete(format!("Desktop file is missing: {relative_path}"));
+            return StepCheck::incomplete("App files need repair.");
         }
     }
     StepCheck::complete()
@@ -2775,10 +2828,10 @@ mod tests {
         write_release_manifest(&dir.path, &["desktop/package.json", "runtime/missing.txt"]);
         fs::write(dir.path.join("desktop").join("package.json"), "{}").expect("write desktop file");
 
-        let complete =
-            tauri::async_runtime::block_on(payload_step_complete(&dir.path.to_string_lossy()));
+        let check = tauri::async_runtime::block_on(payload_step_check(&dir.path.to_string_lossy()));
 
-        assert!(!complete);
+        assert!(!check.complete);
+        assert_eq!(check.reason.as_deref(), Some("App files need repair."));
     }
 
     #[test]
