@@ -315,6 +315,26 @@ fn launch_script_name() -> &'static str {
 fn launch_script_of(d: &str) -> PathBuf {
     Path::new(d).join(launch_script_name())
 }
+
+fn desktop_launch_command(low_resource_mode: bool) -> Vec<String> {
+    if low_resource_mode {
+        vec![
+            "bun".into(),
+            "run".into(),
+            "electron:dev:low-resource".into(),
+        ]
+    } else {
+        vec!["bun".into(), "run".into(), "electron:dev".into()]
+    }
+}
+
+fn desktop_launch_command_line(low_resource_mode: bool) -> &'static str {
+    if low_resource_mode {
+        "bun run electron:dev:low-resource"
+    } else {
+        "bun run electron:dev"
+    }
+}
 fn env_file_of(d: &str) -> PathBuf {
     desktop_dir_of(d).join(ENV_FILE_NAME)
 }
@@ -656,6 +676,7 @@ async fn write_settings(ctx: &InstallerContext, state: &InstallerState) {
             existing.installed_path
         },
         run_after_install: Some(state.run_after_install),
+        low_resource_mode: state.low_resource_mode,
     };
     if let Some(parent) = ctx.settings_file_path.parent() {
         let _ = fs::create_dir_all(parent).await;
@@ -666,9 +687,10 @@ async fn write_settings(ctx: &InstallerContext, state: &InstallerState) {
 
 // ── Launch script ───────────────────────────────────────────────────
 
-async fn write_launch_script(install_dir: &str) -> String {
+async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> String {
     let script_path = launch_script_of(install_dir);
     let launch_env = dugite_launch_env(install_dir);
+    let launch_command = desktop_launch_command_line(low_resource_mode);
 
     if cfg!(target_os = "windows") {
         let mut content = format!("@echo off\r\ncd /d \"{install_dir}\"\r\n");
@@ -687,7 +709,8 @@ async fn write_launch_script(install_dir: &str) -> String {
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("set \"PATH={path_value}\"\r\n"));
         }
-        content.push_str("bun run electron:dev\r\n");
+        content.push_str(launch_command);
+        content.push_str("\r\n");
         let _ = fs::write(&script_path, content).await;
     } else {
         let mut content = format!("#!/bin/sh\ncd \"{install_dir}\"\n");
@@ -714,7 +737,9 @@ async fn write_launch_script(install_dir: &str) -> String {
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("export PATH=\"{path_value}\"\n"));
         }
-        content.push_str("exec bun run electron:dev\n");
+        content.push_str("exec ");
+        content.push_str(launch_command);
+        content.push('\n');
         let _ = fs::write(&script_path, &content).await;
         #[cfg(unix)]
         {
@@ -2258,7 +2283,7 @@ async fn install_step(
             Ok(())
         }
         SetupStepId::Finalize => {
-            let script_path = write_launch_script(&dir).await;
+            let script_path = write_launch_script(&dir, state.low_resource_mode).await;
             let release_manifest = read_release_manifest(&dir).await.ok();
 
             // Init git repo for self-mod in the background so install completion
@@ -2391,6 +2416,7 @@ pub async fn create_initial_state(ctx: &InstallerContext) -> InstallerState {
         install_path_locked: ctx.dev_mode,
         install_path_error: None,
         run_after_install: settings.run_after_install.unwrap_or(true),
+        low_resource_mode: settings.low_resource_mode,
         can_launch: false,
         installed: false,
         launcher_update: LauncherUpdateInfo {
@@ -2437,6 +2463,20 @@ pub async fn set_run_after_install(
         return;
     }
     state.run_after_install = value;
+    write_settings(ctx, state).await;
+}
+
+pub async fn set_low_resource_mode(
+    state: &mut InstallerState,
+    ctx: &InstallerContext,
+    value: bool,
+) {
+    if ctx.dev_mode {
+        state.low_resource_mode = false;
+        return;
+    }
+    state.low_resource_mode = value;
+    let _ = write_launch_script(&state.install_path, state.low_resource_mode).await;
     write_settings(ctx, state).await;
 }
 
@@ -2579,7 +2619,7 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
     env.insert("STELLA_LAUNCHER_MANAGED_RUNTIME".into(), "1".into());
 
     Some(LaunchInfo {
-        command: vec!["bun".into(), "run".into(), "electron:dev".into()],
+        command: desktop_launch_command(state.low_resource_mode),
         cwd: dir.clone(),
         env,
     })

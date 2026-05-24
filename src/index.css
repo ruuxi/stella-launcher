@@ -730,6 +730,59 @@ body {
 	border-color: color-mix(in oklab, var(--red) 60%, var(--border));
 }
 
+.settings-toggle-row {
+	cursor: pointer;
+	position: relative;
+}
+
+.settings-toggle-row:has(.settings-toggle-input:disabled) {
+	opacity: 0.55;
+	cursor: not-allowed;
+}
+
+.settings-toggle-input {
+	position: absolute;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.settings-toggle-track {
+	width: 42px;
+	height: 24px;
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	background: var(--surface);
+	position: relative;
+	flex-shrink: 0;
+	transition: background 0.15s, border-color 0.15s;
+}
+
+.settings-toggle-thumb {
+	position: absolute;
+	top: 3px;
+	left: 3px;
+	width: 16px;
+	height: 16px;
+	border-radius: 999px;
+	background: var(--text-faint);
+	transition: transform 0.15s, background 0.15s;
+}
+
+.settings-toggle-input:checked + .settings-toggle-track {
+	background: color-mix(in oklab, var(--accent) 28%, var(--surface));
+	border-color: color-mix(in oklab, var(--accent) 72%, var(--border));
+}
+
+.settings-toggle-input:checked + .settings-toggle-track .settings-toggle-thumb {
+	transform: translateX(18px);
+	background: var(--accent);
+}
+
+.settings-toggle-input:focus-visible + .settings-toggle-track {
+	outline: 2px solid color-mix(in oklab, var(--accent) 45%, transparent);
+	outline-offset: 2px;
+}
+
 .repair-status {
 	font-size: 12px;
 	color: var(--text-dim);

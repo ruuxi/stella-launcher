@@ -56,6 +56,7 @@ export type InstallerState = {
   installPathLocked: boolean;
   installPathError?: string;
   runAfterInstall: boolean;
+  lowResourceMode: boolean;
   canLaunch: boolean;
   installed: boolean;
   launcherUpdate: LauncherUpdateInfo;

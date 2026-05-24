@@ -267,6 +267,17 @@ function App() {
     await invoke<{ ok: boolean }>("launch_desktop");
   }, []);
 
+  const handleLowResourceModeChange = useCallback(
+    async (value: boolean) => {
+      applyState(
+        await invoke<InstallerState>("set_low_resource_mode", {
+          value,
+        }),
+      );
+    },
+    [applyState],
+  );
+
   const handleLauncherUpdate = useCallback(async () => {
     try {
       await invoke("apply_launcher_update");
@@ -828,6 +839,13 @@ function App() {
               onInstall={handleLauncherUpdate}
               disabled={anyDialogBusy}
             />
+            <SettingsToggleRow
+              title="Low Resource Mode"
+              body="Launch Stella without live reload. Startup takes longer after changes, but idle memory is much lower. Applies next launch."
+              checked={state.lowResourceMode}
+              onChange={handleLowResourceModeChange}
+              disabled={anyDialogBusy}
+            />
             <SettingsRow
               title="Reinstall"
               body="Replace Stella with a fresh copy. Your chats and memories stay; Stella's customizations reset."
@@ -1245,6 +1263,45 @@ const SettingsRow = ({
         )}
       </button>
     </div>
+  );
+};
+
+type SettingsToggleRowProps = {
+  title: string;
+  body: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void | Promise<void>;
+  disabled?: boolean;
+};
+
+const SettingsToggleRow = ({
+  title,
+  body,
+  checked,
+  onChange,
+  disabled = false,
+}: SettingsToggleRowProps) => {
+  return (
+    <label className="settings-row settings-toggle-row">
+      <div className="settings-row-info">
+        <span className="settings-row-title">{title}</span>
+        <span className="settings-row-body">{body}</span>
+      </div>
+      <input
+        type="checkbox"
+        className="settings-toggle-input"
+        checked={checked}
+        onChange={(event) => {
+          void Promise.resolve(onChange(event.currentTarget.checked)).catch(
+            () => {},
+          );
+        }}
+        disabled={disabled}
+      />
+      <span className="settings-toggle-track" aria-hidden="true">
+        <span className="settings-toggle-thumb" />
+      </span>
+    </label>
   );
 };
 

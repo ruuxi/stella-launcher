@@ -135,6 +135,7 @@ pub struct InstallerState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install_path_error: Option<String>,
     pub run_after_install: bool,
+    pub low_resource_mode: bool,
     pub can_launch: bool,
     pub installed: bool,
     pub launcher_update: LauncherUpdateInfo,
@@ -160,6 +161,8 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_path: Option<String>,
     pub run_after_install: Option<bool>,
+    #[serde(default)]
+    pub low_resource_mode: bool,
 }
 
 // ── Install manifest ────────────────────────────────────────────────

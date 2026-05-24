@@ -354,8 +354,8 @@ fn launch_log_path(install_path: &str) -> PathBuf {
     Path::new(install_path).join(LAUNCH_LOG_NAME)
 }
 
-/// Spawn `bun run electron:dev` while keeping the child handle so the
-/// launcher can detect non-zero exits, but still detach the underlying
+/// Spawn the selected desktop launch command while keeping the child handle
+/// so the launcher can detect non-zero exits, but still detach the underlying
 /// process group so quitting the launcher leaves Stella running. stdout
 /// and stderr are merged into a rolling log file under the install root.
 ///
@@ -584,6 +584,21 @@ pub async fn set_run_after_install(
 ) -> Result<InstallerState, String> {
     let mut installer = state.installer.lock().await;
     setup::set_run_after_install(&mut installer, &state.context, value).await;
+    let _ = app.emit(
+        "installer-state-update",
+        serde_json::json!({ "state": &*installer }),
+    );
+    Ok(installer.clone())
+}
+
+#[tauri::command]
+pub async fn set_low_resource_mode(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    value: bool,
+) -> Result<InstallerState, String> {
+    let mut installer = state.installer.lock().await;
+    setup::set_low_resource_mode(&mut installer, &state.context, value).await;
     let _ = app.emit(
         "installer-state-update",
         serde_json::json!({ "state": &*installer }),

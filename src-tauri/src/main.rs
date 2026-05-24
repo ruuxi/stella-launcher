@@ -279,6 +279,7 @@ fn main() {
             commands::browse_install_location,
             commands::set_install_location,
             commands::set_run_after_install,
+            commands::set_low_resource_mode,
             commands::start_install,
             commands::launch_desktop,
             commands::check_launcher_update,
