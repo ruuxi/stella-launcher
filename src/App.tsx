@@ -34,95 +34,6 @@ type ConfirmDialogProps = {
   busyLabel?: string;
 };
 
-type ThirdPartyMigrationSource = "hermes" | "openclaw";
-
-type ThirdPartyMigrationOption =
-  | "memory"
-  | "user"
-  | "sessionHistory"
-  | "skills"
-  | "personality"
-  | "modelConfig"
-  | "schedules";
-
-type ThirdPartyMigrationSelection = Partial<
-  Record<ThirdPartyMigrationOption, boolean>
->;
-
-type ThirdPartyMigrationFinding = {
-  option: ThirdPartyMigrationOption;
-  label: string;
-  found: boolean;
-  count: number;
-  paths: string[];
-  note?: string;
-};
-
-type ThirdPartyMigrationPreview = {
-  source: ThirdPartyMigrationSource;
-  sourceRoot: string;
-  displayName: string;
-  found: boolean;
-  findings: ThirdPartyMigrationFinding[];
-};
-
-type ThirdPartyMigrationReportItem = {
-  kind: ThirdPartyMigrationOption | "channels" | "source" | "report";
-  status: "imported" | "skipped" | "manual" | "error";
-  source?: string;
-  target?: string;
-  message: string;
-  count?: number;
-};
-
-type ThirdPartyMigrationReport = {
-  source: ThirdPartyMigrationSource;
-  sourceRoot: string;
-  stellaHome: string;
-  startedAt: string;
-  completedAt: string;
-  markdownPath: string;
-  items: ThirdPartyMigrationReportItem[];
-};
-
-const MIGRATION_OPTION_ORDER: ThirdPartyMigrationOption[] = [
-  "memory",
-  "user",
-  "sessionHistory",
-  "skills",
-  "personality",
-  "modelConfig",
-  "schedules",
-];
-
-const MIGRATION_OPTION_LABELS: Record<ThirdPartyMigrationOption, string> = {
-  memory: "Memory",
-  user: "User profile",
-  sessionHistory: "Session history",
-  skills: "Skills",
-  personality: "Personality",
-  modelConfig: "Model setup",
-  schedules: "Schedules",
-};
-
-const MIGRATION_SOURCE_LABELS: Record<ThirdPartyMigrationSource, string> = {
-  hermes: "Hermes",
-  openclaw: "OpenClaw",
-};
-
-const IMPORT_OFFER_DISMISSED_KEY = "stella-launcher-import-offer-dismissed";
-
-function readImportOfferDismissed(): boolean {
-  try {
-    return localStorage.getItem(IMPORT_OFFER_DISMISSED_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-const migrationPreviewKey = (preview: ThirdPartyMigrationPreview): string =>
-  `${preview.source}:${preview.sourceRoot}`;
-
 const ConfirmDialog = ({
   steps,
   onCancel,
@@ -195,315 +106,6 @@ const ConfirmDialog = ({
   );
 };
 
-const createMigrationSelection = (
-  preview: ThirdPartyMigrationPreview,
-): ThirdPartyMigrationSelection =>
-  Object.fromEntries(
-    MIGRATION_OPTION_ORDER.map((option) => [
-      option,
-      Boolean(preview.findings.find((finding) => finding.option === option)?.found),
-    ]),
-  ) as ThirdPartyMigrationSelection;
-
-const migrationItemsByStatus = (
-  report: ThirdPartyMigrationReport | null,
-  status: ThirdPartyMigrationReportItem["status"],
-) => report?.items.filter((item) => item.status === status) ?? [];
-
-function LauncherImportSection({
-  disabled,
-  dismissed,
-  onDismiss,
-  onOpenImport,
-  onDetectedChange,
-}: {
-  disabled: boolean;
-  dismissed: boolean;
-  onDismiss: () => void;
-  onOpenImport: (preview: ThirdPartyMigrationPreview) => void;
-  onDetectedChange?: (detected: boolean) => void;
-}) {
-  const [previews, setPreviews] = useState<ThirdPartyMigrationPreview[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      setLoading(true);
-      try {
-        const next = await invoke<ThirdPartyMigrationPreview[]>(
-          "detect_third_party_import_sources",
-        );
-        if (!cancelled) {
-          const foundPreviews = next.filter((preview) => preview.found);
-          onDetectedChange?.(foundPreviews.length > 0);
-          setPreviews(foundPreviews);
-          setError(null);
-        }
-      } catch (nextError) {
-        if (!cancelled) {
-          onDetectedChange?.(false);
-          setPreviews([]);
-          setError(
-            nextError instanceof Error
-              ? nextError.message
-              : "Failed to check for imports.",
-          );
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void load();
-    return () => {
-      cancelled = true;
-    };
-  }, [onDetectedChange]);
-
-  if (loading || previews.length === 0 || dismissed) {
-    return null;
-  }
-
-  return (
-    <section className="import-section">
-      <div className="import-section-header">
-        <div>
-          <h2 className="import-section-title">Bring your setup to Stella</h2>
-          <p className="import-section-body">
-            Import memory, skills, sessions, and model choices from another
-            local assistant.
-          </p>
-        </div>
-        <button
-          type="button"
-          className="import-dialog-close"
-          onClick={onDismiss}
-          disabled={disabled}
-          aria-label="Dismiss import"
-        >
-          ×
-        </button>
-      </div>
-      {error && <div className="banner banner-error">{error}</div>}
-      <div className="import-tile-list">
-        {previews.map((preview) => (
-          <button
-            key={migrationPreviewKey(preview)}
-            type="button"
-            className="import-tile"
-            disabled={disabled}
-            onClick={() => onOpenImport(preview)}
-          >
-            <span className="import-tile-title">
-              Import from {MIGRATION_SOURCE_LABELS[preview.source]}
-            </span>
-            <span className="import-tile-path">{preview.sourceRoot}</span>
-          </button>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function LauncherImportPage({
-  preview,
-  onBack,
-}: {
-  preview: ThirdPartyMigrationPreview;
-  onBack: () => void;
-}) {
-  const [selection, setSelection] = useState<ThirdPartyMigrationSelection>(() =>
-    createMigrationSelection(preview),
-  );
-  const [running, setRunning] = useState(false);
-  const [report, setReport] = useState<ThirdPartyMigrationReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setSelection(createMigrationSelection(preview));
-    setReport(null);
-    setError(null);
-  }, [preview]);
-
-  const toggleOption = (option: ThirdPartyMigrationOption) => {
-    setSelection((current) => ({
-      ...current,
-      [option]: !current[option],
-    }));
-  };
-
-  const runImport = async () => {
-    setRunning(true);
-    setError(null);
-    try {
-      const nextReport = await invoke<ThirdPartyMigrationReport>(
-        "run_third_party_import",
-        {
-          source: preview.source,
-          sourceRoot: preview.sourceRoot,
-          selection,
-        },
-      );
-      setReport(nextReport);
-    } catch (nextError) {
-      setError(
-        nextError instanceof Error ? nextError.message : "Import failed.",
-      );
-    } finally {
-      setRunning(false);
-    }
-  };
-
-  return (
-    <main className="body import-page" key="import">
-      <div className="settings-header">
-        <button
-          type="button"
-          className="link-btn settings-back"
-          onClick={onBack}
-          disabled={running}
-        >
-          ← Back
-        </button>
-        <span className="settings-title">
-          Import from {MIGRATION_SOURCE_LABELS[preview.source]}
-        </span>
-      </div>
-
-      <div className="import-page-card">
-        <p className="dialog-body">
-          Stella reads the old install and writes only to Stella's own files.
-        </p>
-
-        <div className="import-source-path">{preview.sourceRoot}</div>
-
-        {error && <div className="banner banner-error">{error}</div>}
-
-        {report ? (
-          <div className="import-report">
-            <ReportGroup
-              title="Imported"
-              items={migrationItemsByStatus(report, "imported")}
-            />
-            <ReportGroup
-              title="Skipped"
-              items={migrationItemsByStatus(report, "skipped")}
-            />
-            <ReportGroup
-              title="Needs review"
-              items={[
-                ...migrationItemsByStatus(report, "manual"),
-                ...migrationItemsByStatus(report, "error"),
-              ]}
-            />
-            <p className="import-report-note">
-              Channels skipped - re-enable in Stella settings (no setup
-              required).
-            </p>
-            <div className="dialog-actions">
-              <button
-                type="button"
-                className="dialog-btn dialog-btn--primary"
-                onClick={onBack}
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        ) : (
-          <>
-            <div className="import-checklist">
-              {MIGRATION_OPTION_ORDER.map((option) => {
-                const finding =
-                  preview.findings.find((item) => item.option === option) ??
-                  null;
-                const optionDisabled = !finding?.found || running;
-                return (
-                  <label
-                    key={option}
-                    className={`import-check-row${optionDisabled ? " is-disabled" : ""}`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={Boolean(selection[option])}
-                      disabled={optionDisabled}
-                      onChange={() => toggleOption(option)}
-                    />
-                    <span className="import-check-label">
-                      {MIGRATION_OPTION_LABELS[option]}
-                    </span>
-                    <span className="import-check-meta">
-                      {finding?.found
-                        ? `${finding.count} found`
-                        : "Nothing found"}
-                    </span>
-                  </label>
-                );
-              })}
-            </div>
-            <p className="import-dialog-note">
-              Channel pairings are skipped because Stella channels are
-              zero-setup.
-            </p>
-            <div className="dialog-actions">
-              <button
-                type="button"
-                className="dialog-btn dialog-btn--secondary"
-                onClick={onBack}
-                disabled={running}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="dialog-btn dialog-btn--primary"
-                onClick={() => void runImport()}
-                disabled={
-                  running ||
-                  !MIGRATION_OPTION_ORDER.some((option) => selection[option])
-                }
-              >
-                {running ? (
-                  <>
-                    <span className="link-spinner" />
-                    Importing...
-                  </>
-                ) : (
-                  "Run import"
-                )}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </main>
-  );
-}
-
-function ReportGroup({
-  title,
-  items,
-}: {
-  title: string;
-  items: ThirdPartyMigrationReportItem[];
-}) {
-  return (
-    <section className="import-report-group">
-      <div className="import-report-title">{title}</div>
-      {items.length > 0 ? (
-        <ul>
-          {items.map((item, index) => (
-            <li key={`${item.kind}-${index}`}>{item.message}</li>
-          ))}
-        </ul>
-      ) : (
-        <p>None.</p>
-      )}
-    </section>
-  );
-}
-
 /* ── App ─────────────────────────────────────────────────────────── */
 
 type SettingsAction =
@@ -520,15 +122,7 @@ function App() {
   const [reinstalling, setReinstalling] = useState(false);
   const [erasing, setErasing] = useState(false);
   const [desktopRunning, setDesktopRunning] = useState(false);
-  const [view, setView] = useState<"main" | "settings" | "repair" | "import">(
-    "main",
-  );
-  const [activeImportPreview, setActiveImportPreview] =
-    useState<ThirdPartyMigrationPreview | null>(null);
-  const [importOfferDismissed, setImportOfferDismissed] = useState(
-    readImportOfferDismissed,
-  );
-  const [importSourcesDetected, setImportSourcesDetected] = useState(false);
+  const [view, setView] = useState<"main" | "settings" | "repair">("main");
   const [pendingAction, setPendingAction] = useState<SettingsAction | null>(
     null,
   );
@@ -658,22 +252,6 @@ function App() {
 
   const handleLaunch = useCallback(async () => {
     await invoke<{ ok: boolean }>("launch_desktop");
-  }, []);
-
-  const dismissImportOffer = useCallback(() => {
-    try {
-      localStorage.setItem(IMPORT_OFFER_DISMISSED_KEY, "1");
-    } catch {}
-    setImportOfferDismissed(true);
-    setActiveImportPreview(null);
-    setView("main");
-  }, []);
-
-  const showImportOffer = useCallback(() => {
-    try {
-      localStorage.removeItem(IMPORT_OFFER_DISMISSED_KEY);
-    } catch {}
-    setImportOfferDismissed(false);
   }, []);
 
   const handleLowResourceModeChange = useCallback(
@@ -929,9 +507,7 @@ function App() {
     !state.devMode && state.launcherUpdate.installing;
   const settingsOpen = view === "settings" && !state.devMode;
   const repairOpen = view === "repair" && !state.devMode;
-  const importOpen =
-    view === "import" && !state.devMode && activeImportPreview !== null;
-  const sideViewOpen = settingsOpen || repairOpen || importOpen;
+  const sideViewOpen = settingsOpen || repairOpen;
   const anyDialogBusy = uninstalling || reinstalling || erasing || reverting;
 
   const dialogStepsForAction = (
@@ -1173,15 +749,7 @@ function App() {
       )}
 
       {/* Body */}
-      {importOpen && activeImportPreview ? (
-        <LauncherImportPage
-          preview={activeImportPreview}
-          onBack={() => {
-            setActiveImportPreview(null);
-            setView("main");
-          }}
-        />
-      ) : repairOpen ? (
+      {repairOpen ? (
         <main className="body settings-view" key="repair">
           <div className="settings-header">
             <button
@@ -1504,18 +1072,6 @@ function App() {
           {/* ── Complete / warnings ─────────────────────────── */}
           {(isComplete || state.launcherUpdate.error) && (
             <div className="complete-body">
-              {isComplete && state.installed && (
-                <LauncherImportSection
-                  disabled={desktopRunning || anyDialogBusy}
-                  dismissed={importOfferDismissed}
-                  onDismiss={dismissImportOffer}
-                  onDetectedChange={setImportSourcesDetected}
-                  onOpenImport={(preview) => {
-                    setActiveImportPreview(preview);
-                    setView("import");
-                  }}
-                />
-              )}
               {isComplete && state.warningMessage && (
                 <div className="banner banner-warn" style={{ marginTop: 16 }}>
                   {state.warningMessage}
@@ -1617,19 +1173,6 @@ function App() {
                   Settings
                 </button>
               )}
-              {isComplete &&
-                state.installed &&
-                importSourcesDetected &&
-                importOfferDismissed && (
-                  <button
-                    type="button"
-                    className="link-btn"
-                    onClick={showImportOffer}
-                    disabled={anyDialogBusy}
-                  >
-                    Import
-                  </button>
-                )}
             </div>
           )}
         </footer>
