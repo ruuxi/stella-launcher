@@ -1142,9 +1142,7 @@ pub async fn uninstall_stella(
     stop_desktop_by_path(&installer.install_path);
     let result = setup::uninstall(&mut installer).await;
 
-    if result.is_ok() {
-        setup::check_all(&mut installer, &state.context, &app).await;
-    } else if let Err(err) = &result {
+    if let Err(err) = &result {
         installer.phase = InstallerPhase::Error;
         installer.error_message = Some(err.clone());
     }
@@ -1169,9 +1167,7 @@ pub async fn full_reset_stella(
     stop_desktop_by_path(&installer.install_path);
     let result = setup::full_reset(&mut installer).await;
 
-    if result.is_ok() {
-        setup::check_all(&mut installer, &state.context, &app).await;
-    } else if let Err(err) = &result {
+    if let Err(err) = &result {
         installer.phase = InstallerPhase::Error;
         installer.error_message = Some(err.clone());
     }
