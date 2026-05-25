@@ -110,6 +110,9 @@ const MIGRATION_SOURCE_LABELS: Record<ThirdPartyMigrationSource, string> = {
   openclaw: "OpenClaw",
 };
 
+const migrationPreviewKey = (preview: ThirdPartyMigrationPreview): string =>
+  `${preview.source}:${preview.sourceRoot}`;
+
 const ConfirmDialog = ({
   steps,
   onCancel,
@@ -303,7 +306,7 @@ function LauncherImportSection({ disabled }: { disabled: boolean }) {
         <div className="import-tile-list">
           {previews.map((preview) => (
             <button
-              key={preview.source}
+              key={migrationPreviewKey(preview)}
               type="button"
               className="import-tile"
               disabled={disabled}
