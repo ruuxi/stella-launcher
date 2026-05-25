@@ -1163,7 +1163,7 @@ function App() {
                   Repair
                 </button>
               )}
-              {isComplete && state.installed && !desktopRunning && (
+              {!desktopRunning && (
                 <button
                   type="button"
                   className="link-btn"
