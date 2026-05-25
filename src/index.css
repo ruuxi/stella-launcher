@@ -120,6 +120,12 @@ body {
 	padding-bottom: 8px;
 }
 
+.shell--complete .body.settings-view {
+	flex: 1;
+	min-height: 0;
+	padding-bottom: 24px;
+}
+
 .shell--complete .complete-body {
 	flex: 0 0 auto;
 }
@@ -621,11 +627,14 @@ body {
 
 /* ── Settings view ────────────────────────────────────────────── */
 
-.settings-view {
+.body.settings-view {
+	flex: 1;
+	min-height: 0;
 	padding: 12px 24px 24px;
 	display: flex;
 	flex-direction: column;
 	gap: 14px;
+	overflow: hidden;
 }
 
 .settings-header {
@@ -652,6 +661,8 @@ body {
 }
 
 .settings-list {
+	flex: 1;
+	min-height: 0;
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
