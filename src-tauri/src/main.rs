@@ -276,6 +276,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_installer_state,
+            commands::detect_third_party_import_sources,
+            commands::run_third_party_import,
             commands::browse_install_location,
             commands::set_install_location,
             commands::set_run_after_install,

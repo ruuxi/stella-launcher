@@ -465,6 +465,231 @@ body {
 	flex: 1;
 }
 
+.import-section {
+	width: 100%;
+	max-width: 360px;
+	margin: 0 auto 16px;
+	padding: 14px;
+	border: 1px solid var(--border);
+	border-radius: 10px;
+	background: var(--bg);
+	text-align: left;
+	animation: fadeIn 0.2s ease;
+}
+
+.import-section-header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 10px;
+}
+
+.import-section-title {
+	font-size: 14px;
+	font-weight: 650;
+	color: var(--text);
+	margin: 0 0 3px;
+	letter-spacing: 0;
+}
+
+.import-section-body {
+	font-size: 12px;
+	line-height: 1.45;
+	color: var(--text-dim);
+	margin: 0;
+}
+
+.import-tile-list {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+
+.import-tile {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 2px;
+	padding: 10px 11px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--surface);
+	color: var(--text);
+	font-family: var(--font);
+	text-align: left;
+	cursor: pointer;
+	transition: border-color 0.15s, background 0.15s;
+}
+
+.import-tile:hover:not(:disabled) {
+	border-color: var(--accent);
+	background: color-mix(in oklab, var(--accent) 7%, var(--surface));
+}
+
+.import-tile:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+.import-tile-title {
+	font-size: 12.5px;
+	font-weight: 650;
+	color: var(--text);
+}
+
+.import-tile-path {
+	font-family: var(--mono);
+	font-size: 10.5px;
+	color: var(--text-dim);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.import-dialog-card {
+	max-width: 420px;
+	gap: 12px;
+	text-align: left;
+}
+
+.import-dialog-header {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.import-dialog-close {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	border: 1px solid transparent;
+	border-radius: 999px;
+	background: transparent;
+	color: var(--text-faint);
+	font-size: 18px;
+	line-height: 1;
+	cursor: pointer;
+}
+
+.import-dialog-close:hover:not(:disabled) {
+	color: var(--text);
+	border-color: var(--border);
+}
+
+.import-checklist {
+	border-top: 1px solid var(--border);
+	border-bottom: 1px solid var(--border);
+}
+
+.import-check-row {
+	display: grid;
+	grid-template-columns: 18px minmax(0, 1fr) auto;
+	gap: 9px;
+	align-items: center;
+	padding: 9px 0;
+	font-size: 12px;
+	color: var(--text);
+}
+
+.import-check-row + .import-check-row {
+	border-top: 1px solid var(--border);
+}
+
+.import-check-row.is-disabled {
+	opacity: 0.45;
+}
+
+.import-check-row input {
+	appearance: none;
+	-webkit-appearance: none;
+	width: 16px;
+	height: 16px;
+	border: 1.5px solid var(--border);
+	border-radius: 4px;
+	background: var(--bg);
+	position: relative;
+}
+
+.import-check-row input:checked {
+	background: var(--accent);
+	border-color: var(--accent);
+}
+
+.import-check-row input:checked::after {
+	content: "";
+	position: absolute;
+	top: 2px;
+	left: 4.5px;
+	width: 4.5px;
+	height: 8px;
+	border: solid #fff;
+	border-width: 0 1.5px 1.5px 0;
+	transform: rotate(45deg);
+}
+
+.import-check-label {
+	min-width: 0;
+	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.import-check-meta {
+	color: var(--text-dim);
+	font-size: 11px;
+	white-space: nowrap;
+}
+
+.import-dialog-note,
+.import-report-note {
+	font-size: 11.5px;
+	line-height: 1.45;
+	color: var(--text-dim);
+	margin: 0;
+}
+
+.import-report {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.import-report-group {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.import-report-title {
+	font-size: 10px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--text-faint);
+}
+
+.import-report-group ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+}
+
+.import-report-group li,
+.import-report-group p {
+	margin: 0;
+	font-size: 11.5px;
+	line-height: 1.4;
+	color: var(--text-dim);
+}
+
 /* ── Footer ───────────────────────────────────────────────────────── */
 
 .footer {

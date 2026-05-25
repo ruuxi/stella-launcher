@@ -34,6 +34,82 @@ type ConfirmDialogProps = {
   busyLabel?: string;
 };
 
+type ThirdPartyMigrationSource = "hermes" | "openclaw";
+
+type ThirdPartyMigrationOption =
+  | "memory"
+  | "user"
+  | "sessionHistory"
+  | "skills"
+  | "personality"
+  | "modelConfig"
+  | "schedules";
+
+type ThirdPartyMigrationSelection = Partial<
+  Record<ThirdPartyMigrationOption, boolean>
+>;
+
+type ThirdPartyMigrationFinding = {
+  option: ThirdPartyMigrationOption;
+  label: string;
+  found: boolean;
+  count: number;
+  paths: string[];
+  note?: string;
+};
+
+type ThirdPartyMigrationPreview = {
+  source: ThirdPartyMigrationSource;
+  sourceRoot: string;
+  displayName: string;
+  found: boolean;
+  findings: ThirdPartyMigrationFinding[];
+};
+
+type ThirdPartyMigrationReportItem = {
+  kind: ThirdPartyMigrationOption | "channels" | "source" | "report";
+  status: "imported" | "skipped" | "manual" | "error";
+  source?: string;
+  target?: string;
+  message: string;
+  count?: number;
+};
+
+type ThirdPartyMigrationReport = {
+  source: ThirdPartyMigrationSource;
+  sourceRoot: string;
+  stellaHome: string;
+  startedAt: string;
+  completedAt: string;
+  markdownPath: string;
+  items: ThirdPartyMigrationReportItem[];
+};
+
+const MIGRATION_OPTION_ORDER: ThirdPartyMigrationOption[] = [
+  "memory",
+  "user",
+  "sessionHistory",
+  "skills",
+  "personality",
+  "modelConfig",
+  "schedules",
+];
+
+const MIGRATION_OPTION_LABELS: Record<ThirdPartyMigrationOption, string> = {
+  memory: "Memory",
+  user: "User profile",
+  sessionHistory: "Session history",
+  skills: "Skills",
+  personality: "Personality",
+  modelConfig: "Model setup",
+  schedules: "Schedules",
+};
+
+const MIGRATION_SOURCE_LABELS: Record<ThirdPartyMigrationSource, string> = {
+  hermes: "Hermes",
+  openclaw: "OpenClaw",
+};
+
 const ConfirmDialog = ({
   steps,
   onCancel,
@@ -105,6 +181,295 @@ const ConfirmDialog = ({
     </div>
   );
 };
+
+const createMigrationSelection = (
+  preview: ThirdPartyMigrationPreview,
+): ThirdPartyMigrationSelection =>
+  Object.fromEntries(
+    MIGRATION_OPTION_ORDER.map((option) => [
+      option,
+      Boolean(preview.findings.find((finding) => finding.option === option)?.found),
+    ]),
+  ) as ThirdPartyMigrationSelection;
+
+const migrationItemsByStatus = (
+  report: ThirdPartyMigrationReport | null,
+  status: ThirdPartyMigrationReportItem["status"],
+) => report?.items.filter((item) => item.status === status) ?? [];
+
+function LauncherImportSection({ disabled }: { disabled: boolean }) {
+  const [previews, setPreviews] = useState<ThirdPartyMigrationPreview[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [activePreview, setActivePreview] =
+    useState<ThirdPartyMigrationPreview | null>(null);
+  const [selection, setSelection] = useState<ThirdPartyMigrationSelection>({});
+  const [running, setRunning] = useState(false);
+  const [report, setReport] = useState<ThirdPartyMigrationReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      setLoading(true);
+      try {
+        const next = await invoke<ThirdPartyMigrationPreview[]>(
+          "detect_third_party_import_sources",
+        );
+        if (!cancelled) {
+          setPreviews(next.filter((preview) => preview.found));
+          setError(null);
+        }
+      } catch (nextError) {
+        if (!cancelled) {
+          setPreviews([]);
+          setError(
+            nextError instanceof Error
+              ? nextError.message
+              : "Failed to check for imports.",
+          );
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const openWizard = (preview: ThirdPartyMigrationPreview) => {
+    setActivePreview(preview);
+    setSelection(createMigrationSelection(preview));
+    setReport(null);
+    setError(null);
+  };
+
+  const closeWizard = () => {
+    if (running) return;
+    setActivePreview(null);
+    setReport(null);
+    setError(null);
+  };
+
+  const toggleOption = (option: ThirdPartyMigrationOption) => {
+    setSelection((current) => ({
+      ...current,
+      [option]: !current[option],
+    }));
+  };
+
+  const runImport = async () => {
+    if (!activePreview) return;
+    setRunning(true);
+    setError(null);
+    try {
+      const nextReport = await invoke<ThirdPartyMigrationReport>(
+        "run_third_party_import",
+        {
+          source: activePreview.source,
+          sourceRoot: activePreview.sourceRoot,
+          selection,
+        },
+      );
+      setReport(nextReport);
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Import failed.",
+      );
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  if (loading || previews.length === 0) {
+    return null;
+  }
+
+  return (
+    <>
+      <section className="import-section">
+        <div className="import-section-header">
+          <div>
+            <h2 className="import-section-title">Bring your setup to Stella</h2>
+            <p className="import-section-body">
+              Import memory, skills, sessions, and model choices from another
+              local assistant.
+            </p>
+          </div>
+        </div>
+        <div className="import-tile-list">
+          {previews.map((preview) => (
+            <button
+              key={preview.source}
+              type="button"
+              className="import-tile"
+              disabled={disabled}
+              onClick={() => openWizard(preview)}
+            >
+              <span className="import-tile-title">
+                Import from {MIGRATION_SOURCE_LABELS[preview.source]}
+              </span>
+              <span className="import-tile-path">{preview.sourceRoot}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {activePreview && (
+        <div className="dialog-overlay" role="dialog" aria-modal="true">
+          <div className="dialog-card import-dialog-card">
+            <div className="import-dialog-header">
+              <div>
+                <h2 className="dialog-title">
+                  Import from {MIGRATION_SOURCE_LABELS[activePreview.source]}
+                </h2>
+                <p className="dialog-body">
+                  Stella reads the old install and writes only to Stella's own
+                  files.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="import-dialog-close"
+                onClick={closeWizard}
+                disabled={running}
+                aria-label="Close import"
+              >
+                X
+              </button>
+            </div>
+
+            {error && <div className="banner banner-error">{error}</div>}
+
+            {report ? (
+              <div className="import-report">
+                <ReportGroup
+                  title="Imported"
+                  items={migrationItemsByStatus(report, "imported")}
+                />
+                <ReportGroup
+                  title="Skipped"
+                  items={migrationItemsByStatus(report, "skipped")}
+                />
+                <ReportGroup
+                  title="Needs review"
+                  items={[
+                    ...migrationItemsByStatus(report, "manual"),
+                    ...migrationItemsByStatus(report, "error"),
+                  ]}
+                />
+                <p className="import-report-note">
+                  Channels skipped - re-enable in Stella settings (no setup
+                  required).
+                </p>
+                <div className="dialog-actions">
+                  <button
+                    type="button"
+                    className="dialog-btn dialog-btn--primary"
+                    onClick={closeWizard}
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="import-checklist">
+                  {MIGRATION_OPTION_ORDER.map((option) => {
+                    const finding =
+                      activePreview.findings.find(
+                        (item) => item.option === option,
+                      ) ?? null;
+                    const optionDisabled = !finding?.found || running;
+                    return (
+                      <label
+                        key={option}
+                        className={`import-check-row${optionDisabled ? " is-disabled" : ""}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={Boolean(selection[option])}
+                          disabled={optionDisabled}
+                          onChange={() => toggleOption(option)}
+                        />
+                        <span className="import-check-label">
+                          {MIGRATION_OPTION_LABELS[option]}
+                        </span>
+                        <span className="import-check-meta">
+                          {finding?.found
+                            ? `${finding.count} found`
+                            : "Nothing found"}
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="import-dialog-note">
+                  Channel pairings are skipped because Stella channels are
+                  zero-setup.
+                </p>
+                <div className="dialog-actions">
+                  <button
+                    type="button"
+                    className="dialog-btn dialog-btn--secondary"
+                    onClick={closeWizard}
+                    disabled={running}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="dialog-btn dialog-btn--primary"
+                    onClick={() => void runImport()}
+                    disabled={
+                      running ||
+                      !MIGRATION_OPTION_ORDER.some((option) => selection[option])
+                    }
+                  >
+                    {running ? (
+                      <>
+                        <span className="link-spinner" />
+                        Importing...
+                      </>
+                    ) : (
+                      "Run import"
+                    )}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ReportGroup({
+  title,
+  items,
+}: {
+  title: string;
+  items: ThirdPartyMigrationReportItem[];
+}) {
+  return (
+    <section className="import-report-group">
+      <div className="import-report-title">{title}</div>
+      {items.length > 0 ? (
+        <ul>
+          {items.map((item, index) => (
+            <li key={`${item.kind}-${index}`}>{item.message}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>None.</p>
+      )}
+    </section>
+  );
+}
 
 /* ── App ─────────────────────────────────────────────────────────── */
 
@@ -1090,6 +1455,11 @@ function App() {
           {/* ── Complete / warnings ─────────────────────────── */}
           {(isComplete || state.launcherUpdate.error) && (
             <div className="complete-body">
+              {isComplete && state.installed && (
+                <LauncherImportSection
+                  disabled={desktopRunning || anyDialogBusy}
+                />
+              )}
               {isComplete && state.warningMessage && (
                 <div className="banner banner-warn" style={{ marginTop: 16 }}>
                   {state.warningMessage}

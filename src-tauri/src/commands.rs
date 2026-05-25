@@ -30,6 +30,13 @@ fn desktop_pid_file(install_path: &str) -> std::path::PathBuf {
     Path::new(install_path).join("desktop").join(PID_FILE_NAME)
 }
 
+fn third_party_import_script(install_path: &str) -> PathBuf {
+    Path::new(install_path)
+        .join("desktop")
+        .join("scripts")
+        .join("run-third-party-import.ts")
+}
+
 fn read_pid_file(install_path: &str) -> Option<u32> {
     let path = desktop_pid_file(install_path);
     let raw = std::fs::read_to_string(&path).ok()?;
@@ -216,6 +223,49 @@ fn cleanup_install_processes(install_path: &str) {
 
 #[cfg(not(target_os = "windows"))]
 fn cleanup_install_processes(_install_path: &str) {}
+
+async fn run_third_party_import_script(
+    install_path: String,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(move || {
+        let script = third_party_import_script(&install_path);
+        if !script.is_file() {
+            return Err("The Stella importer is not installed yet.".to_string());
+        }
+
+        let mut command = StdCommand::new("bun");
+        command
+            .arg(script)
+            .arg(payload.to_string())
+            .current_dir(&install_path)
+            .envs(setup::dugite_launch_env(&install_path))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        command.creation_flags(CREATE_NO_WINDOW);
+
+        let output = command
+            .output()
+            .map_err(|err| format!("Failed to start importer: {err}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                "Import failed.".to_string()
+            } else {
+                stderr
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        serde_json::from_str(&stdout)
+            .map_err(|err| format!("Importer returned invalid JSON: {err}"))
+    })
+    .await
+    .map_err(|err| format!("Importer task failed: {err}"))?
+}
 
 pub fn stop_desktop_by_path(install_path: &str) {
     if let Some(pid) = read_pid_file(install_path) {
@@ -634,6 +684,49 @@ pub async fn get_installer_state(
     );
 
     Ok(installer.clone())
+}
+
+#[tauri::command]
+pub async fn detect_third_party_import_sources(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let install_path = {
+        let installer = state.installer.lock().await;
+        installer.install_path.clone()
+    };
+    run_third_party_import_script(
+        install_path,
+        serde_json::json!({
+            "action": "detect",
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn run_third_party_import(
+    state: State<'_, AppState>,
+    source: String,
+    source_root: Option<String>,
+    selection: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if source != "hermes" && source != "openclaw" {
+        return Err("Unsupported import source.".to_string());
+    }
+    let install_path = {
+        let installer = state.installer.lock().await;
+        installer.install_path.clone()
+    };
+    run_third_party_import_script(
+        install_path,
+        serde_json::json!({
+            "action": "run",
+            "source": source,
+            "sourceRoot": source_root,
+            "selection": selection,
+        }),
+    )
+    .await
 }
 
 #[tauri::command]
