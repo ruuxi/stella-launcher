@@ -18,7 +18,9 @@
         "skipTaskbar": false,
         "resizable": false,
         "decorations": false,
-        "transparent": true,
+        "transparent": false,
+        "backgroundColor": "#ffffff",
+        "shadow": true,
         "center": true
       }
     ],
