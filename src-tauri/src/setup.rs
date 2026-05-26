@@ -2687,10 +2687,44 @@ pub async fn uninstall(state: &mut InstallerState) -> Result<(), String> {
     Ok(())
 }
 
-/// Wipe the entire Stella install directory — including `state/` and
-/// everything `uninstall()` deliberately preserves. This is the user-visible
-/// "Erase everything" surface and is intentionally destructive: chats,
-/// memories, settings, mods, agent edits all go.
+/// Path to the durable Stella home directory (`~/.stella`). The desktop
+/// runtime treats this folder as the source of truth for chats, memories,
+/// credentials, the skill catalog, the SQLite database — every artifact
+/// that should survive an upgrade. "Erase everything" is intentionally
+/// destructive and must wipe it alongside the install root.
+fn stella_home_dir() -> PathBuf {
+    home_dir().join(".stella")
+}
+
+/// Refuse to nuke anything that doesn't look like our home directory.
+/// In practice this means the path must sit directly inside the user's
+/// home as the literal `.stella` folder. Any drift (test environments
+/// without a real `$HOME`, a manually relocated home, etc.) bails out
+/// instead of risking unrelated user data.
+fn is_erasable_stella_home(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    if path.file_name().and_then(|n| n.to_str()) != Some(".stella") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let expected_parent = home_dir();
+    if expected_parent.as_os_str().is_empty() {
+        return false;
+    }
+    match (parent.canonicalize(), expected_parent.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => parent == expected_parent,
+    }
+}
+
+/// Wipe the entire Stella install directory AND the durable home
+/// (`~/.stella`). This is the user-visible "Erase everything" surface
+/// and is intentionally destructive: chats, memories, settings, mods,
+/// agent edits, credentials all go.
 pub async fn full_reset(state: &mut InstallerState) -> Result<(), String> {
     if path_exists_str(&state.install_path).await {
         if !is_uninstallable_install_path(&state.install_path) {
@@ -2703,6 +2737,19 @@ pub async fn full_reset(state: &mut InstallerState) -> Result<(), String> {
         fs::remove_dir_all(&state.install_path)
             .await
             .map_err(|e| format!("Failed to erase Stella folder: {e}"))?;
+    }
+
+    let home = stella_home_dir();
+    if path_exists(&home).await {
+        if !is_erasable_stella_home(&home) {
+            let msg = "Refusing to erase a folder that does not look like ~/.stella.".to_string();
+            state.phase = InstallerPhase::Error;
+            state.error_message = Some(msg.clone());
+            return Err(msg);
+        }
+        fs::remove_dir_all(&home)
+            .await
+            .map_err(|e| format!("Failed to erase Stella home: {e}"))?;
     }
 
     remove_registry().await;
@@ -2893,6 +2940,37 @@ mod tests {
             .expect("write temp archive");
 
         assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
+    }
+
+    #[test]
+    fn erasable_stella_home_requires_dot_stella_inside_real_home() {
+        // The literal `~/.stella` is the only path the launcher should ever
+        // wipe — anything else (a sibling folder, an arbitrary temp dir,
+        // even `~/.stella-archive`) must be refused.
+        let home = home_dir();
+        if home.as_os_str().is_empty() {
+            return;
+        }
+
+        assert!(!is_erasable_stella_home(Path::new("/")));
+        assert!(!is_erasable_stella_home(&home));
+        assert!(!is_erasable_stella_home(&home.join(".stella-archive")));
+
+        let dir = TestDir::new("erasable-home-wrong-parent");
+        let nested = dir.path.join(".stella");
+        fs::create_dir_all(&nested).expect("create nested .stella");
+        // Right name, wrong parent → refused.
+        assert!(!is_erasable_stella_home(&nested));
+    }
+
+    #[test]
+    fn erasable_stella_home_rejects_missing_or_file_paths() {
+        let dir = TestDir::new("erasable-home-missing");
+        assert!(!is_erasable_stella_home(&dir.path.join(".stella")));
+
+        let file_path = dir.path.join(".stella");
+        fs::write(&file_path, "not a dir").expect("write sentinel");
+        assert!(!is_erasable_stella_home(&file_path));
     }
 
     #[test]
