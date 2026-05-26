@@ -2274,7 +2274,13 @@ async fn parakeet_step_check(dir: &str) -> StepCheck {
     {
         StepCheck::complete()
     } else {
-        StepCheck::incomplete("Local dictation model is missing.")
+        // No detail line — the step label ("Preparing local dictation") is
+        // enough on its own; a "model is missing" reason just adds noise to
+        // the install screen.
+        StepCheck {
+            complete: false,
+            reason: None,
+        }
     }
 }
 
@@ -2312,11 +2318,9 @@ async fn install_step(
         SetupStepId::NativeHelpers => download_and_extract_native_helpers(&dir, state, app).await,
         SetupStepId::Parakeet => {
             if let Err(err) = ensure_parakeet_model_downloaded(&dir).await {
-                let warning = format!(
-                    "Local dictation setup was skipped. Stella will still work, but on-device dictation may be unavailable. ({err})"
-                );
-                log_install(&dir, &format!("Parakeet install warning: {warning}")).await;
-                state.warning_message = Some(warning);
+                // Log for debugging, but don't pop a banner — local dictation
+                // is optional and the failure isn't actionable for the user.
+                log_install(&dir, &format!("Parakeet install warning: {err}")).await;
             }
             Ok(())
         }
