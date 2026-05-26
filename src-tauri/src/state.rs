@@ -48,6 +48,7 @@ pub struct RevertableCommit {
 #[serde(rename_all = "lowercase")]
 pub enum SetupStepId {
     Runtime,
+    Tsgo,
     Parakeet,
     Payload,
     NativeHelpers,
