@@ -2125,6 +2125,17 @@ impl StepCheck {
             reason: Some(reason.into()),
         }
     }
+
+    /// Mark a step incomplete without attaching a "reason" string. Use
+    /// this when the step label alone conveys what's happening — adding
+    /// a "<thing> is missing" reason during a fresh install is just
+    /// noise that duplicates the pending status indicator.
+    fn incomplete_silent() -> Self {
+        Self {
+            complete: false,
+            reason: None,
+        }
+    }
 }
 
 fn build_step_defs() -> Vec<StepDef> {
@@ -2159,7 +2170,7 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
             if bun_on_path().await {
                 StepCheck::complete()
             } else {
-                StepCheck::incomplete("Bun is not available yet.")
+                StepCheck::incomplete_silent()
             }
         }
         SetupStepId::Payload => payload_step_check(dir).await,
@@ -2169,7 +2180,7 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
             if state.dev_mode || valid_install_manifest_exists(dir).await {
                 StepCheck::complete()
             } else {
-                StepCheck::incomplete("Stella's install record is missing or invalid.")
+                StepCheck::incomplete_silent()
             }
         }
         _ => StepCheck::complete(),
@@ -2182,19 +2193,19 @@ async fn payload_step_complete(dir: &str) -> bool {
 
 async fn payload_step_check(dir: &str) -> StepCheck {
     if !path_exists(&node_modules_of(dir)).await {
-        return StepCheck::incomplete("Desktop dependencies are missing.");
+        return StepCheck::incomplete_silent();
     }
     if !path_exists(&electron_dist_dir_of(dir)).await {
-        return StepCheck::incomplete("Electron binary is missing.");
+        return StepCheck::incomplete_silent();
     }
     if !looks_like_stella_source_tree(Path::new(dir)) {
         return StepCheck::incomplete("The selected folder is not a Stella desktop install.");
     }
     let Ok(manifest) = read_release_manifest(dir).await else {
-        return StepCheck::incomplete("Desktop release manifest is missing or invalid.");
+        return StepCheck::incomplete_silent();
     };
     if manifest.files.is_empty() {
-        return StepCheck::incomplete("Desktop release manifest has no file list.");
+        return StepCheck::incomplete_silent();
     }
     for relative_path in manifest.files.keys() {
         if !path_exists(&Path::new(dir).join(relative_path)).await {
@@ -2211,7 +2222,7 @@ async fn native_helpers_step_complete(dir: &str) -> bool {
 async fn native_helpers_step_check(dir: &str) -> StepCheck {
     let helpers_dir = native_helpers_dir_of(dir);
     if !path_exists(&helpers_dir).await {
-        return StepCheck::incomplete("Native helper folder is missing.");
+        return StepCheck::incomplete_silent();
     }
     // Sentinel: pick a binary that ships on every supported platform.
     let sentinel = if cfg!(target_os = "windows") {
@@ -2220,7 +2231,7 @@ async fn native_helpers_step_check(dir: &str) -> StepCheck {
         helpers_dir.join("window_info")
     };
     if !path_exists(&sentinel).await {
-        return StepCheck::incomplete("Native helper binary is missing.");
+        return StepCheck::incomplete_silent();
     }
 
     let Ok(release_manifest) = read_release_manifest(dir).await else {
@@ -2266,7 +2277,7 @@ async fn parakeet_step_check(dir: &str) -> StepCheck {
         return if native_helpers_step_complete(dir).await && payload_step_complete(dir).await {
             StepCheck::complete()
         } else {
-            StepCheck::incomplete("Waiting for Stella and native helpers first.")
+            StepCheck::incomplete_silent()
         };
     }
     if path_exists(&parakeet_cache_dir_of(dir).join("FluidAudio")).await
@@ -2274,13 +2285,7 @@ async fn parakeet_step_check(dir: &str) -> StepCheck {
     {
         StepCheck::complete()
     } else {
-        // No detail line — the step label ("Preparing local dictation") is
-        // enough on its own; a "model is missing" reason just adds noise to
-        // the install screen.
-        StepCheck {
-            complete: false,
-            reason: None,
-        }
+        StepCheck::incomplete_silent()
     }
 }
 
@@ -2993,8 +2998,10 @@ mod tests {
 
         let check = tauri::async_runtime::block_on(payload_step_check(&dir.path.to_string_lossy()));
 
+        // Pre-install state is silent — the step label conveys the status
+        // and a "binary is missing" detail string was just noise.
         assert!(!check.complete);
-        assert_eq!(check.reason.as_deref(), Some("Electron binary is missing."));
+        assert_eq!(check.reason, None);
     }
 
     #[test]
