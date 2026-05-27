@@ -604,26 +604,31 @@ fn native_helpers_base_url() -> String {
         .unwrap_or_else(|| DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL.to_string())
 }
 
-async fn native_helpers_manifest_url_for_install(install_dir: &str) -> String {
+async fn native_helpers_manifest_urls_for_install(install_dir: &str) -> Vec<String> {
     if std::env::var("STELLA_NATIVE_HELPERS_MANIFEST_URL")
         .ok()
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
     {
-        return native_helpers_manifest_url();
+        return vec![native_helpers_manifest_url()];
     }
 
+    let mut urls = Vec::new();
     if let Ok(release) = read_release_manifest(install_dir).await {
         if release.tag.starts_with("desktop-v") {
-            return format!(
+            urls.push(format!(
                 "{}/{}/manifest.json",
                 native_helpers_base_url(),
                 release.tag
-            );
+            ));
         }
     }
 
-    native_helpers_manifest_url()
+    let current_url = native_helpers_manifest_url();
+    if !urls.iter().any(|url| url == &current_url) {
+        urls.push(current_url);
+    }
+    urls
 }
 
 fn desktop_platform_key() -> &'static str {
@@ -1565,12 +1570,7 @@ async fn download_and_extract_native_helpers(
     app: &AppHandle,
 ) -> Result<(), String> {
     let platform = native_helpers_platform_key();
-    let manifest_url = native_helpers_manifest_url_for_install(install_dir).await;
-    log_install(
-        install_dir,
-        &format!("Resolving native helpers manifest: {manifest_url}"),
-    )
-    .await;
+    let manifest_urls = native_helpers_manifest_urls_for_install(install_dir).await;
     set_step_progress(
         state,
         app,
@@ -1580,7 +1580,34 @@ async fn download_and_extract_native_helpers(
     );
 
     let client = reqwest::Client::new();
-    let manifest_text = fetch_required_text(&client, &manifest_url).await?;
+    let mut manifest_source: Option<(String, String)> = None;
+    let mut manifest_errors = Vec::new();
+    for manifest_url in manifest_urls {
+        log_install(
+            install_dir,
+            &format!("Resolving native helpers manifest: {manifest_url}"),
+        )
+        .await;
+        match fetch_required_text(&client, &manifest_url).await {
+            Ok(manifest_text) => {
+                manifest_source = Some((manifest_url, manifest_text));
+                break;
+            }
+            Err(err) => {
+                log_install(
+                    install_dir,
+                    &format!("Native helpers manifest unavailable: {err}"),
+                )
+                .await;
+                manifest_errors.push(err);
+            }
+        }
+    }
+    let (manifest_url, manifest_text) = manifest_source.ok_or_else(|| {
+        manifest_errors
+            .pop()
+            .unwrap_or_else(|| "Native helpers manifest was unavailable.".to_string())
+    })?;
     let manifest: NativeHelpersManifest = serde_json::from_str(&manifest_text)
         .map_err(|e| format!("Native helpers manifest was invalid JSON: {e}"))?;
     if manifest.schema_version != 1 {
@@ -2313,32 +2340,19 @@ async fn native_helpers_step_check(dir: &str) -> StepCheck {
         return StepCheck::incomplete_silent();
     }
 
-    let Ok(release_manifest) = read_release_manifest(dir).await else {
-        return StepCheck::complete();
-    };
-    let expected_tag = release_manifest.tag;
-    if !expected_tag.starts_with("desktop-v") {
-        return StepCheck::complete();
-    }
-
     let install_manifest_path = native_helpers_install_manifest_of(dir);
     let Ok(raw) = fs::read_to_string(&install_manifest_path).await else {
         // Legacy installs did not write helper metadata. Keep them launchable;
         // desktop update/repair paths can refresh and add the manifest.
         return StepCheck::complete();
     };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Ok(_parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return StepCheck::incomplete("Native helper install record is invalid.");
     };
-    if parsed
-        .get("sha")
-        .and_then(|value| value.as_str())
-        .is_some_and(|sha| sha == expected_tag)
-    {
-        StepCheck::complete()
-    } else {
-        StepCheck::incomplete(format!("Native helpers do not match {expected_tag}."))
-    }
+    // Native helper releases are compatibility payloads and may intentionally
+    // lag the desktop release. The launcher only needs the helper shape to be
+    // present and its install record to be readable.
+    StepCheck::complete()
 }
 
 #[cfg(test)]
@@ -2899,6 +2913,10 @@ mod tests {
     }
 
     fn write_release_manifest(path: &Path, files: &[&str]) {
+        write_release_manifest_with_tag(path, "desktop-v0.0.1", files);
+    }
+
+    fn write_release_manifest_with_tag(path: &Path, tag: &str, files: &[&str]) {
         let files_json = files
             .iter()
             .map(|file| format!(r#""{file}":{{"sha256":"abc"}}"#))
@@ -2906,7 +2924,7 @@ mod tests {
             .join(",");
         fs::write(
             path.join(RELEASE_MANIFEST),
-            format!(r#"{{"schemaVersion":1,"tag":"desktop-v0.0.1","files":{{{files_json}}}}}"#),
+            format!(r#"{{"schemaVersion":1,"tag":"{tag}","files":{{{files_json}}}}}"#),
         )
         .expect("write release manifest");
     }
@@ -2921,6 +2939,19 @@ mod tests {
             helpers_dir.join("window_info")
         };
         fs::write(sentinel, "").expect("write native helper sentinel");
+    }
+
+    fn write_native_helpers_install_manifest(path: &Path, sha: &str) {
+        let install_dir = path.to_string_lossy();
+        let manifest_path = native_helpers_install_manifest_of(&install_dir);
+        fs::write(
+            manifest_path,
+            format!(
+                r#"{{"schemaVersion":1,"sha":"{sha}","platform":"{}"}}"#,
+                native_helpers_platform_key()
+            ),
+        )
+        .expect("write native helpers install manifest");
     }
 
     fn write_generic_package_shape(path: &Path) {
@@ -3117,6 +3148,42 @@ mod tests {
             tauri::async_runtime::block_on(payload_step_complete(&dir.path.to_string_lossy()));
 
         assert!(complete);
+    }
+
+    #[test]
+    fn native_helpers_completion_accepts_lagging_helper_release() {
+        let dir = TestDir::new("lagging-native-helpers");
+        write_install_shape(&dir.path);
+        write_release_manifest_with_tag(&dir.path, "desktop-v0.0.253", &["desktop/package.json"]);
+        write_native_helpers_shape(&dir.path);
+        write_native_helpers_install_manifest(&dir.path, "desktop-v0.0.248");
+
+        let check =
+            tauri::async_runtime::block_on(native_helpers_step_check(&dir.path.to_string_lossy()));
+
+        assert!(check.complete);
+        assert_eq!(check.reason, None);
+    }
+
+    #[test]
+    fn native_helpers_manifest_urls_fall_back_to_current_manifest() {
+        let dir = TestDir::new("native-helper-manifest-fallback");
+        write_release_manifest_with_tag(&dir.path, "desktop-v0.0.253", &[]);
+
+        let urls = tauri::async_runtime::block_on(native_helpers_manifest_urls_for_install(
+            &dir.path.to_string_lossy(),
+        ));
+
+        assert_eq!(
+            urls,
+            vec![
+                format!(
+                    "{}/desktop-v0.0.253/manifest.json",
+                    DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL
+                ),
+                DEFAULT_NATIVE_HELPERS_MANIFEST_URL.to_string(),
+            ]
+        );
     }
 
     #[test]
