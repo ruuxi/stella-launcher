@@ -852,70 +852,6 @@ async fn bun_on_path() -> bool {
     false
 }
 
-// ── tsgo (TypeScript-Go preview) ───────────────────────────────────
-//
-// tsgo is invoked by the desktop's build/typecheck scripts and by the
-// self-mod agent's verification step, so it needs to be findable on the
-// user's PATH. We install it as a global Bun package the same way a
-// developer would normally install `tsc` via `npm install -g typescript`.
-//
-// Pinning the version here (rather than reading it from the desktop's
-// package.json) keeps cold installs deterministic and lets the launcher
-// drive forward-upgrades by bumping this constant — the sentinel file
-// written next to `~/.bun/bin/tsgo` is what `check_step` compares against
-// to decide whether to reinstall.
-const TSGO_VERSION: &str = "7.0.0-dev.20260508.1";
-
-fn tsgo_executable_of() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        bun_bin_dir().join("tsgo.exe")
-    } else {
-        bun_bin_dir().join("tsgo")
-    }
-}
-
-fn tsgo_version_sentinel() -> PathBuf {
-    home_dir().join(".bun").join(".stella-tsgo-version")
-}
-
-async fn read_tsgo_sentinel_version() -> Option<String> {
-    fs::read_to_string(tsgo_version_sentinel())
-        .await
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-async fn write_tsgo_sentinel_version() {
-    let _ = fs::write(tsgo_version_sentinel(), TSGO_VERSION).await;
-}
-
-async fn tsgo_on_path() -> bool {
-    if run(&["tsgo", "--version"], None).await.ok {
-        return true;
-    }
-
-    let tsgo_bin = tsgo_executable_of();
-    if path_exists(&tsgo_bin).await {
-        if let Some(bin_dir) = tsgo_bin.parent() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            std::env::set_var("PATH", prepend_path_entry(bin_dir, &current_path));
-            return run(&["tsgo", "--version"], None).await.ok;
-        }
-    }
-
-    false
-}
-
-async fn install_tsgo_globally() -> bool {
-    let spec = format!("@typescript/native-preview@{TSGO_VERSION}");
-    let result = run(&["bun", "install", "-g", &spec], None).await;
-    if !result.ok {
-        return false;
-    }
-    write_tsgo_sentinel_version().await;
-    tsgo_on_path().await
-}
-
 async fn install_bun_globally() -> bool {
     if cfg!(target_os = "windows") {
         let result = run(
@@ -2236,10 +2172,6 @@ fn build_step_defs() -> Vec<StepDef> {
             label: "Setting up",
         },
         StepDef {
-            id: SetupStepId::Tsgo,
-            label: "Installing TypeScript",
-        },
-        StepDef {
             id: SetupStepId::Payload,
             label: "Downloading Stella",
         },
@@ -2266,17 +2198,6 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
                 StepCheck::complete()
             } else {
                 StepCheck::incomplete_silent()
-            }
-        }
-        SetupStepId::Tsgo => {
-            if !tsgo_on_path().await {
-                return StepCheck::incomplete_silent();
-            }
-            // Re-install when the launcher's pinned version moves forward
-            // so users on an older tsgo get upgraded silently on next launch.
-            match read_tsgo_sentinel_version().await {
-                Some(installed) if installed == TSGO_VERSION => StepCheck::complete(),
-                _ => StepCheck::incomplete_silent(),
             }
         }
         SetupStepId::Payload => payload_step_check(dir).await,
@@ -2397,13 +2318,6 @@ async fn install_step(
                 Ok(())
             } else {
                 Err("Failed to install Bun runtime. Check your internet connection.".into())
-            }
-        }
-        SetupStepId::Tsgo => {
-            if install_tsgo_globally().await {
-                Ok(())
-            } else {
-                Err("Failed to install TypeScript. Check your internet connection.".into())
             }
         }
         SetupStepId::Payload => {

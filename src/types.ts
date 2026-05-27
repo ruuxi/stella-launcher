@@ -1,6 +1,5 @@
 export type SetupStepId =
   | "runtime"
-  | "tsgo"
   | "prepare"
   | "parakeet"
   | "payload"
