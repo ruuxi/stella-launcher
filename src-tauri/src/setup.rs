@@ -2,12 +2,14 @@ use crate::disk;
 use crate::shell::run;
 use crate::state::*;
 use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, CONTENT_RANGE, RANGE};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -35,6 +37,9 @@ const DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/native-helpers";
 const INSTALL_DIR_NAME: &str = "stella";
 const ELECTRON_USER_DATA_DIR_NAME: &str = "electron-user-data";
+const DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn release_tarball_name() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
@@ -76,7 +81,7 @@ fn release_latest_download_url() -> String {
 /// Get the newest `desktop-v*` release tag from GitHub (fallback when `releases/latest` is not a desktop release).
 async fn latest_release_tag() -> Option<String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=100");
-    let client = reqwest::Client::new();
+    let client = download_client().ok()?;
     let resp = client
         .get(&url)
         .header("User-Agent", "stella-launcher")
@@ -217,10 +222,19 @@ fn is_directory_empty(path: &Path) -> bool {
 }
 
 fn is_state_only_install_dir(path: &Path) -> bool {
+    is_recoverable_launcher_install_dir(path, true)
+}
+
+fn is_partial_launcher_install_dir(path: &Path) -> bool {
+    is_recoverable_launcher_install_dir(path, false)
+}
+
+fn is_recoverable_launcher_install_dir(path: &Path, require_state: bool) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
     let mut saw_state = false;
+    let mut saw_launcher_artifact = false;
     for entry in entries {
         let Ok(entry) = entry else {
             return false;
@@ -241,18 +255,23 @@ fn is_state_only_install_dir(path: &Path) -> bool {
         if file_type.is_file()
             && (name == "stella-install.log"
                 || name == ".DS_Store"
-                || name == ".stella-desktop-download.tar.zst")
+                || name == ".stella-desktop-download.tar.zst"
+                || name == ".stella-native-helpers-download.tar.zst")
         {
+            saw_launcher_artifact = true;
             continue;
         }
         return false;
     }
-    saw_state
+    saw_state || (!require_state && saw_launcher_artifact)
 }
 
 pub fn is_uninstallable_install_path(install_path: &str) -> bool {
     let path = Path::new(install_path);
-    path.is_dir() && (looks_like_stella_install_dir(path) || is_state_only_install_dir(path))
+    path.is_dir()
+        && (looks_like_stella_install_dir(path)
+            || is_state_only_install_dir(path)
+            || is_partial_launcher_install_dir(path))
 }
 
 fn manifest_of(d: &str) -> PathBuf {
@@ -470,6 +489,7 @@ fn location_error(p: &str) -> Option<String> {
         if !looks_like_stella_install_dir(&pb)
             && !is_directory_empty(&pb)
             && !is_state_only_install_dir(&pb)
+            && !is_partial_launcher_install_dir(&pb)
         {
             return Some(format!(
                 "Stella needs its own `{INSTALL_DIR_NAME}` folder. Choose a parent folder or an existing Stella install."
@@ -1269,7 +1289,7 @@ async fn download_and_extract_release(
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    let client = download_client()?;
     let latest_url = release_latest_download_url();
     log_install(install_dir, &format!("Downloading {latest_url}")).await;
     set_step_progress(
@@ -1292,7 +1312,7 @@ async fn download_and_extract_release(
         }
     };
 
-    let (resp, expected_sha256, expected_size) = if let Some(asset) = r2_asset {
+    let (download_url, expected_sha256, expected_size) = if let Some(asset) = r2_asset {
         set_step_progress(
             state,
             app,
@@ -1300,16 +1320,7 @@ async fn download_and_extract_release(
             "Connecting to Stella downloads",
             Some(0.04),
         );
-        let resp = client
-            .get(&asset.url)
-            .header("User-Agent", "stella-launcher")
-            .send()
-            .await
-            .map_err(|e| format!("Download failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("Download failed: HTTP {}", resp.status()));
-        }
-        (resp, Some(asset.sha256), Some(asset.size))
+        (asset.url, Some(asset.sha256), Some(asset.size))
     } else {
         set_step_progress(
             state,
@@ -1325,8 +1336,8 @@ async fn download_and_extract_release(
             .await
             .map_err(|e| format!("Download failed: {e}"))?;
 
-        let resp = if resp.status().is_success() {
-            resp
+        let url = if resp.status().is_success() {
+            latest_url
         } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
             let tag = latest_release_tag()
                 .await
@@ -1353,72 +1364,32 @@ async fn download_and_extract_release(
             if !resp.status().is_success() {
                 return Err(format!("Download failed: HTTP {}", resp.status()));
             }
-            resp
+            url
         } else {
             return Err(format!("Download failed: HTTP {}", resp.status()));
         };
-        (resp, None, None)
+        (url, None, None)
     };
 
-    let total_bytes = resp.content_length().or(expected_size);
     fs::create_dir_all(install_dir)
         .await
         .map_err(|e| format!("mkdir failed: {e}"))?;
     let archive_path = Path::new(install_dir).join(".stella-desktop-download.tar.zst");
-    let mut archive_file = fs::File::create(&archive_path)
-        .await
-        .map_err(|e| format!("Failed to prepare download file: {e}"))?;
-    let mut downloaded: u64 = 0;
-    let mut digest = Sha256::new();
-    let mut stream = resp.bytes_stream();
-    let mut last_emit = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                let _ = fs::remove_file(&archive_path).await;
-                return Err(format!("Download failed: {err}"));
-            }
-        };
-        downloaded += chunk.len() as u64;
-        digest.update(&chunk);
-        if let Err(err) = archive_file.write_all(&chunk).await {
-            let _ = fs::remove_file(&archive_path).await;
-            return Err(format!("Failed to write download file: {err}"));
-        }
-
-        if last_emit.elapsed() >= std::time::Duration::from_millis(300) {
-            let detail = if let Some(total) = total_bytes {
-                format!(
-                    "Downloading Stella {} of {}",
-                    format_bytes_compact(downloaded),
-                    format_bytes_compact(total)
-                )
-            } else {
-                format!("Downloading Stella {}", format_bytes_compact(downloaded))
-            };
-            let progress = total_bytes
-                .filter(|total| *total > 0)
-                .map(|total| 0.05 + ((downloaded as f64 / total as f64).min(1.0) * 0.65));
-            set_step_progress(state, app, &SetupStepId::Payload, detail, progress);
-            last_emit = std::time::Instant::now();
-        }
-    }
-    if let Err(err) = archive_file.flush().await {
-        let _ = fs::remove_file(&archive_path).await;
-        return Err(format!("Failed to finish download file: {err}"));
-    }
-    drop(archive_file);
-
-    if let Some(expected) = expected_sha256 {
-        if let Err(err) = verify_sha256_digest(digest, &expected) {
-            let _ = fs::remove_file(&archive_path).await;
-            return Err(err);
-        }
-    }
+    let downloaded = download_archive_with_resume(
+        &client,
+        &download_url,
+        &archive_path,
+        expected_size,
+        expected_sha256.as_deref(),
+        install_dir,
+        state,
+        app,
+        SetupStepId::Payload,
+        "Stella",
+        0.05,
+        0.65,
+    )
+    .await?;
 
     log_install(
         install_dir,
@@ -1515,7 +1486,7 @@ async fn download_and_extract_native_helpers(
         Some(0.05),
     );
 
-    let client = reqwest::Client::new();
+    let client = download_client()?;
     let mut manifest_source: Option<(String, String)> = None;
     let mut manifest_errors = Vec::new();
     for manifest_url in manifest_urls {
@@ -1576,80 +1547,22 @@ async fn download_and_extract_native_helpers(
         Some(0.15),
     );
 
-    let resp = client
-        .get(&asset.url)
-        .header("User-Agent", "stella-launcher")
-        .send()
-        .await
-        .map_err(|e| format!("Native helpers download failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Native helpers download failed: HTTP {}",
-            resp.status()
-        ));
-    }
-
-    let total_bytes = resp.content_length();
     let archive_path = Path::new(install_dir).join(".stella-native-helpers-download.tar.zst");
-    if let Some(parent) = archive_path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir failed: {e}"))?;
-    }
-    let mut archive_file = fs::File::create(&archive_path)
-        .await
-        .map_err(|e| format!("Failed to prepare native helpers download: {e}"))?;
-    let mut downloaded: u64 = 0;
-    let mut digest = Sha256::new();
-    let mut stream = resp.bytes_stream();
-    let mut last_emit = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(1))
-        .unwrap_or_else(std::time::Instant::now);
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                let _ = fs::remove_file(&archive_path).await;
-                return Err(format!("Native helpers download failed: {err}"));
-            }
-        };
-        downloaded += chunk.len() as u64;
-        digest.update(&chunk);
-        if let Err(err) = archive_file.write_all(&chunk).await {
-            let _ = fs::remove_file(&archive_path).await;
-            return Err(format!("Failed to write native helpers download: {err}"));
-        }
-        if last_emit.elapsed() >= std::time::Duration::from_millis(300) {
-            let detail = if let Some(total) = total_bytes {
-                format!(
-                    "Downloading native helpers {} of {}",
-                    format_bytes_compact(downloaded),
-                    format_bytes_compact(total)
-                )
-            } else {
-                format!(
-                    "Downloading native helpers {}",
-                    format_bytes_compact(downloaded)
-                )
-            };
-            let progress = total_bytes
-                .filter(|total| *total > 0)
-                .map(|total| 0.15 + ((downloaded as f64 / total as f64).min(1.0) * 0.55));
-            set_step_progress(state, app, &SetupStepId::NativeHelpers, detail, progress);
-            last_emit = std::time::Instant::now();
-        }
-    }
-    if let Err(err) = archive_file.flush().await {
-        let _ = fs::remove_file(&archive_path).await;
-        return Err(format!("Failed to finish native helpers download: {err}"));
-    }
-    drop(archive_file);
-
-    if let Err(err) = verify_sha256_digest(digest, &asset.sha256) {
-        let _ = fs::remove_file(&archive_path).await;
-        return Err(err);
-    }
+    download_archive_with_resume(
+        &client,
+        &asset.url,
+        &archive_path,
+        Some(asset.size),
+        Some(&asset.sha256),
+        install_dir,
+        state,
+        app,
+        SetupStepId::NativeHelpers,
+        "native helpers",
+        0.15,
+        0.55,
+    )
+    .await?;
 
     set_step_progress(
         state,
@@ -1825,6 +1738,284 @@ fn verify_sha256_digest(digest: Sha256, expected: &str) -> Result<(), String> {
     } else {
         Err("Release checksum did not match the downloaded archive.".into())
     }
+}
+
+fn download_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
+        .build()
+        .map_err(|e| format!("Failed to prepare download client: {e}"))
+}
+
+fn content_range_total(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
+    let total = value.rsplit_once('/')?.1;
+    if total == "*" {
+        None
+    } else {
+        total.parse().ok()
+    }
+}
+
+async fn sha256_file_digest(path: &Path) -> Result<Sha256, String> {
+    let mut file = fs::File::open(path)
+        .await
+        .map_err(|e| format!("Failed to open download for verification: {e}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("Failed to verify download: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_archive_with_resume(
+    client: &reqwest::Client,
+    url: &str,
+    archive_path: &Path,
+    expected_size: Option<u64>,
+    expected_sha256: Option<&str>,
+    install_dir: &str,
+    state: &mut InstallerState,
+    app: &AppHandle,
+    step_id: SetupStepId,
+    item_label: &str,
+    progress_start: f64,
+    progress_span: f64,
+) -> Result<u64, String> {
+    if let Some(parent) = archive_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("mkdir failed: {e}"))?;
+    }
+
+    let mut last_err = None;
+    for attempt in 1..=DOWNLOAD_RETRY_ATTEMPTS {
+        let mut existing_bytes = fs::metadata(archive_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if expected_size
+            .map(|size| existing_bytes > size)
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(archive_path).await;
+            existing_bytes = 0;
+        }
+        if expected_size
+            .map(|size| existing_bytes == size && size > 0)
+            .unwrap_or(false)
+        {
+            if let Some(expected) = expected_sha256 {
+                match sha256_file_digest(archive_path)
+                    .await
+                    .and_then(|digest| verify_sha256_digest(digest, expected))
+                {
+                    Ok(()) => return Ok(existing_bytes),
+                    Err(_) => {
+                        let _ = fs::remove_file(archive_path).await;
+                        existing_bytes = 0;
+                    }
+                }
+            } else {
+                return Ok(existing_bytes);
+            }
+        }
+
+        if existing_bytes > 0 {
+            let detail = format!(
+                "Resuming {item_label} from {}",
+                format_bytes_compact(existing_bytes)
+            );
+            set_step_progress(state, app, &step_id, detail, None);
+        }
+
+        let mut request = client.get(url).header("User-Agent", "stella-launcher");
+        if existing_bytes > 0 {
+            request = request.header(RANGE, format!("bytes={existing_bytes}-"));
+        }
+
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                last_err = Some(format!("{item_label} download failed: {err}"));
+                log_install(
+                    install_dir,
+                    &format!(
+                        "{item_label} download connection failed on attempt {attempt}: {err}"
+                    ),
+                )
+                .await;
+                if attempt < DOWNLOAD_RETRY_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            if expected_size
+                .map(|size| existing_bytes == size)
+                .unwrap_or(false)
+            {
+                if let Some(expected) = expected_sha256 {
+                    let digest = sha256_file_digest(archive_path).await?;
+                    verify_sha256_digest(digest, expected)?;
+                }
+                return Ok(existing_bytes);
+            }
+            let _ = fs::remove_file(archive_path).await;
+            last_err = Some(format!("{item_label} download resume was rejected."));
+            if attempt < DOWNLOAD_RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        if !status.is_success() {
+            return Err(format!("{item_label} download failed: HTTP {status}"));
+        }
+
+        let resuming = existing_bytes > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+        if existing_bytes > 0 && !resuming {
+            log_install(
+                install_dir,
+                &format!("{item_label} server did not resume; restarting download"),
+            )
+            .await;
+            let _ = fs::remove_file(archive_path).await;
+            existing_bytes = 0;
+        }
+
+        let response_total = if resuming {
+            expected_size
+                .or_else(|| content_range_total(resp.headers()))
+                .or_else(|| resp.content_length().map(|length| existing_bytes + length))
+        } else {
+            resp.content_length().or(expected_size)
+        };
+        let mut downloaded = existing_bytes;
+        let mut archive_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(resuming)
+            .truncate(!resuming)
+            .open(archive_path)
+            .await
+            .map_err(|e| format!("Failed to prepare {item_label} download: {e}"))?;
+        let mut stream = resp.bytes_stream();
+        let mut last_emit = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        let mut attempt_err = None;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    attempt_err = Some(format!("{item_label} download failed: {err}"));
+                    break;
+                }
+            };
+            downloaded += chunk.len() as u64;
+            if let Err(err) = archive_file.write_all(&chunk).await {
+                attempt_err = Some(format!("Failed to write {item_label} download: {err}"));
+                break;
+            }
+
+            if last_emit.elapsed() >= Duration::from_millis(300) {
+                let detail = if let Some(total) = response_total {
+                    format!(
+                        "Downloading {item_label} {} of {}",
+                        format_bytes_compact(downloaded),
+                        format_bytes_compact(total)
+                    )
+                } else {
+                    format!(
+                        "Downloading {item_label} {}",
+                        format_bytes_compact(downloaded)
+                    )
+                };
+                let progress = response_total.filter(|total| *total > 0).map(|total| {
+                    progress_start
+                        + ((downloaded as f64 / total as f64).min(1.0) * progress_span)
+                });
+                set_step_progress(state, app, &step_id, detail, progress);
+                last_emit = std::time::Instant::now();
+            }
+        }
+
+        if attempt_err.is_none() {
+            if let Err(err) = archive_file.flush().await {
+                attempt_err = Some(format!("Failed to finish {item_label} download: {err}"));
+            }
+        }
+        drop(archive_file);
+
+        if let Some(err) = attempt_err {
+            last_err = Some(err.clone());
+            log_install(
+                install_dir,
+                &format!(
+                    "{item_label} download interrupted on attempt {attempt}; keeping {} for resume: {err}",
+                    format_bytes_compact(downloaded)
+                ),
+            )
+            .await;
+            if attempt < DOWNLOAD_RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        if expected_size.map(|size| downloaded < size).unwrap_or(false) {
+            last_err = Some(format!(
+                "{item_label} download ended early at {} of {}.",
+                format_bytes_compact(downloaded),
+                format_bytes_compact(expected_size.unwrap_or_default())
+            ));
+            if attempt < DOWNLOAD_RETRY_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                continue;
+            }
+            break;
+        }
+
+        if let Some(expected) = expected_sha256 {
+            match sha256_file_digest(archive_path)
+                .await
+                .and_then(|digest| verify_sha256_digest(digest, expected))
+            {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = fs::remove_file(archive_path).await;
+                    last_err = Some(err);
+                    if attempt < DOWNLOAD_RETRY_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        return Ok(downloaded);
+    }
+
+    Err(last_err.unwrap_or_else(|| format!("{item_label} download failed.")))
 }
 
 async fn resolve_r2_desktop_asset(
@@ -2944,6 +3135,16 @@ mod tests {
     }
 
     #[test]
+    fn location_error_allows_partial_launcher_download_dirs() {
+        let dir = TestDir::new("partial-download");
+        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
+        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "partial")
+            .expect("write partial archive");
+
+        assert_eq!(location_error(&dir.path.to_string_lossy()), None);
+    }
+
+    #[test]
     fn uninstallable_install_path_requires_stella_shape() {
         let dir = TestDir::new("uninstallable");
         assert!(!is_uninstallable_install_path(&dir.path.to_string_lossy()));
@@ -2978,6 +3179,19 @@ mod tests {
         fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
         fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
             .expect("write temp archive");
+
+        assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
+    }
+
+    #[test]
+    fn uninstallable_install_path_allows_partial_launcher_download_dirs() {
+        let dir = TestDir::new("uninstallable-partial-download");
+        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
+        fs::write(
+            dir.path.join(".stella-native-helpers-download.tar.zst"),
+            "partial",
+        )
+        .expect("write partial helpers archive");
 
         assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
     }
@@ -3019,6 +3233,22 @@ mod tests {
         let env = dugite_launch_env(&dir.path.to_string_lossy());
         let path = env.get("PATH").expect("PATH env");
         assert!(path.starts_with(&bun_bin_dir().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn content_range_total_parses_known_totals() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, "bytes 100-199/1234".parse().unwrap());
+
+        assert_eq!(content_range_total(&headers), Some(1234));
+    }
+
+    #[test]
+    fn content_range_total_ignores_unknown_totals() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, "bytes 100-199/*".parse().unwrap());
+
+        assert_eq!(content_range_total(&headers), None);
     }
 
     #[test]
