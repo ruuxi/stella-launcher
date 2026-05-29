@@ -5,12 +5,14 @@ use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, CONTENT_RANGE, RANGE};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::time::{sleep, Instant};
 
 // ── Constants ───────────────────────────────────────────────────────
 
@@ -40,6 +42,8 @@ const ELECTRON_USER_DATA_DIR_NAME: &str = "electron-user-data";
 const DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const WINDOWS_REMOVE_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
+const WINDOWS_REMOVE_RETRY_POLL: Duration = Duration::from_millis(250);
 
 fn release_tarball_name() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
@@ -1671,9 +1675,11 @@ async fn remove_install_files_preserving_state(install_path: &str) -> Result<(),
         .join("state")
         .join(ELECTRON_USER_DATA_DIR_NAME);
     if path_exists(&electron_user_data_path).await {
-        fs::remove_dir_all(&electron_user_data_path)
-            .await
-            .map_err(|e| format!("Failed to remove Stella app startup data: {e}"))?;
+        remove_dir_all_tolerating_windows_lock(
+            &electron_user_data_path,
+            "Failed to remove Stella app startup data",
+        )
+        .await?;
     }
 
     let mut entries = fs::read_dir(install_path)
@@ -1693,16 +1699,58 @@ async fn remove_install_files_preserving_state(install_path: &str) -> Result<(),
             .await
             .map_err(|e| format!("Failed to inspect Stella install entry: {e}"))?;
         if file_type.is_dir() {
-            fs::remove_dir_all(&path)
-                .await
-                .map_err(|e| format!("Failed to remove Stella directory: {e}"))?;
+            remove_dir_all_tolerating_windows_lock(&path, "Failed to remove Stella directory")
+                .await?;
         } else {
-            fs::remove_file(&path)
-                .await
-                .map_err(|e| format!("Failed to remove Stella file: {e}"))?;
+            remove_file_tolerating_windows_lock(&path, "Failed to remove Stella file").await?;
         }
     }
     Ok(())
+}
+
+fn is_transient_windows_remove_error(error: &io::Error) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_DIR_NOT_EMPTY.
+    // The last can surface after a recursive remove partially succeeds while
+    // a child path is still being released by a recently-killed process.
+    matches!(error.raw_os_error(), Some(32 | 33 | 145))
+}
+
+async fn remove_dir_all_tolerating_windows_lock(path: &Path, context: &str) -> Result<(), String> {
+    let deadline = Instant::now() + WINDOWS_REMOVE_RETRY_TIMEOUT;
+    loop {
+        match fs::remove_dir_all(path).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                if is_transient_windows_remove_error(&error) && Instant::now() < deadline {
+                    sleep(WINDOWS_REMOVE_RETRY_POLL).await;
+                    continue;
+                }
+                return Err(format!("{context}: {error}"));
+            }
+        }
+    }
+}
+
+async fn remove_file_tolerating_windows_lock(path: &Path, context: &str) -> Result<(), String> {
+    let deadline = Instant::now() + WINDOWS_REMOVE_RETRY_TIMEOUT;
+    loop {
+        match fs::remove_file(path).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                if is_transient_windows_remove_error(&error) && Instant::now() < deadline {
+                    sleep(WINDOWS_REMOVE_RETRY_POLL).await;
+                    continue;
+                }
+                return Err(format!("{context}: {error}"));
+            }
+        }
+    }
 }
 
 async fn fetch_required_text(client: &reqwest::Client, url: &str) -> Result<String, String> {
