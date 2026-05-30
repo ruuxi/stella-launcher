@@ -2119,8 +2119,8 @@ async fn read_release_manifest(install_dir: &str) -> Result<DesktopReleaseManife
 /// history attached**. The flow is:
 ///
 /// 1. `git init` + add `origin` pointing at the public Stella repo.
-/// 2. `git fetch --filter=blob:none origin <installCommit>` — pulls history
-///    and trees into the local repo without downloading every historical blob.
+/// 2. `git fetch origin <installCommit>` — pulls the release commit into the
+///    local repo using normal Git object storage.
 /// 3. `git reset --mixed <installCommit>` — moves HEAD to the real upstream
 ///    SHA the tarball was built from. The working tree (already on disk
 ///    from the tarball) matches that commit byte-for-byte because the
@@ -2215,7 +2215,6 @@ async fn init_git_repo(install_dir: &str) {
         Some(commit) if !commit.is_empty() => {
             let fetch_result = run_git(vec![
                 "fetch".into(),
-                "--filter=blob:none".into(),
                 "--no-tags".into(),
                 "origin".into(),
                 commit.clone(),
