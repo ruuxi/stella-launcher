@@ -19,10 +19,10 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const PID_FILE_NAME: &str = ".electron-dev-runner.pid";
-#[cfg(target_os = "windows")]
-const WINDOWS_PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "windows")]
-const WINDOWS_PROCESS_CLEANUP_POLL: Duration = Duration::from_millis(150);
+#[cfg(any(unix, target_os = "windows"))]
+const INSTALL_PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(unix, target_os = "windows"))]
+const INSTALL_PROCESS_CLEANUP_POLL: Duration = Duration::from_millis(150);
 #[cfg(target_os = "macos")]
 const LAUNCHER_BUNDLE_ID: &str = "com.stella.launcher";
 
@@ -79,7 +79,9 @@ fn kill_pid_tree(pid: u32) {
     #[cfg(unix)]
     {
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+            if libc::kill(-(pid as i32), libc::SIGTERM) != 0 {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
         }
     }
     #[cfg(windows)]
@@ -96,6 +98,117 @@ fn kill_pid_tree(pid: u32) {
     {
         let _ = pid;
     }
+}
+
+#[cfg(unix)]
+fn install_path_root(install_path: &str) -> Option<String> {
+    let path = std::fs::canonicalize(install_path).unwrap_or_else(|_| PathBuf::from(install_path));
+    let mut value = path.to_string_lossy().to_string();
+    while value.ends_with('/') {
+        value.pop();
+    }
+    if value.len() <= 1 {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(unix)]
+fn comparable_process_text(value: &str) -> String {
+    if cfg!(target_os = "macos") {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_command_matches_install(command: &str, install_root: &str) -> bool {
+    let command = comparable_process_text(command);
+    let root = comparable_process_text(install_root);
+    let root_with_slash = format!("{root}/");
+
+    if !command.contains(&root_with_slash) {
+        return false;
+    }
+
+    let executable = command
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+
+    if command.contains(&format!("{root}/node_modules/"))
+        && matches!(
+            executable,
+            "node" | "bun" | "electron" | "stella" | "esbuild" | "vite"
+        )
+    {
+        return true;
+    }
+
+    if command.contains(&format!("{root}/desktop/scripts/")) && matches!(executable, "node" | "bun")
+    {
+        return true;
+    }
+
+    if command.contains(&format!("{root}/desktop/.vite/"))
+        && matches!(executable, "node" | "bun" | "vite")
+    {
+        return true;
+    }
+
+    if command.contains(&format!("{root}/launch.sh"))
+        && matches!(executable, "sh" | "bash" | "zsh" | "launch.sh")
+    {
+        return true;
+    }
+
+    let shell_executable = matches!(executable, "sh" | "bash" | "zsh");
+    shell_executable
+        && command.contains("stella_deferred_delete_helper")
+        && (command.contains(&format!("cd {root}/"))
+            || command.contains(&format!("cd \"{root}/"))
+            || command.contains(&format!("cd '{root}/")))
+}
+
+#[cfg(unix)]
+fn unix_install_process_pids(install_path: &str) -> Vec<u32> {
+    let Some(root) = install_path_root(install_path) else {
+        return Vec::new();
+    };
+    let output = StdCommand::new("ps")
+        .args(["-axo", "pid=,command="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let (pid, command) = trimmed.split_once(char::is_whitespace)?;
+            let pid = pid.parse::<u32>().ok()?;
+            if pid == 0 || pid == std::process::id() {
+                return None;
+            }
+            if unix_process_command_matches_install(command.trim_start(), &root) {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -185,6 +298,15 @@ fn should_scan_install_processes(install_path: &str) -> bool {
         || root.join("launch.cmd").is_file()
 }
 
+#[cfg(unix)]
+fn should_scan_install_processes(install_path: &str) -> bool {
+    let root = Path::new(install_path);
+    root.join("stella-install.json").is_file()
+        || root.join("stella-release.json").is_file()
+        || root.join("launch.sh").is_file()
+        || root.join("package.json").is_file()
+}
+
 #[cfg(target_os = "windows")]
 fn cleanup_install_processes(install_path: &str) {
     if !setup::is_uninstallable_install_path(install_path)
@@ -202,7 +324,7 @@ fn cleanup_install_processes(install_path: &str) {
         }
     }
 
-    let deadline = Instant::now() + WINDOWS_PROCESS_CLEANUP_TIMEOUT;
+    let deadline = Instant::now() + INSTALL_PROCESS_CLEANUP_TIMEOUT;
     while Instant::now() < deadline {
         let remaining = windows_install_process_pids(install_path)
             .into_iter()
@@ -210,11 +332,40 @@ fn cleanup_install_processes(install_path: &str) {
         if !remaining {
             break;
         }
-        std::thread::sleep(WINDOWS_PROCESS_CLEANUP_POLL);
+        std::thread::sleep(INSTALL_PROCESS_CLEANUP_POLL);
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
+fn cleanup_install_processes(install_path: &str) {
+    if !setup::is_uninstallable_install_path(install_path)
+        || !should_scan_install_processes(install_path)
+    {
+        return;
+    }
+
+    let mut pids = unix_install_process_pids(install_path);
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in &pids {
+        if is_pid_alive(*pid) {
+            kill_pid_tree(*pid);
+        }
+    }
+
+    let deadline = Instant::now() + INSTALL_PROCESS_CLEANUP_TIMEOUT;
+    while Instant::now() < deadline {
+        let remaining = unix_install_process_pids(install_path)
+            .into_iter()
+            .any(is_pid_alive);
+        if !remaining {
+            break;
+        }
+        std::thread::sleep(INSTALL_PROCESS_CLEANUP_POLL);
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 fn cleanup_install_processes(_install_path: &str) {}
 
 pub fn stop_desktop_by_path(install_path: &str) {
@@ -966,6 +1117,57 @@ pub async fn revert_last_self_mod(
 #[tauri::command]
 pub async fn check_launcher_update(app: AppHandle) -> Result<bool, String> {
     crate::check_for_launcher_update(&app, true).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_match_accepts_install_owned_runtime_commands() {
+        let root = "/Users/rahulnanda/Stella";
+
+        assert!(unix_process_command_matches_install(
+            "node /Users/rahulnanda/Stella/node_modules/.bin/vite --port 5210",
+            root,
+        ));
+        assert!(unix_process_command_matches_install(
+            "node /Users/rahulnanda/Stella/desktop/scripts/electron-dev-runner.mjs",
+            root,
+        ));
+        assert!(unix_process_command_matches_install(
+            "/bin/bash -lc __stella_dd() { \"$STELLA_NODE_BIN\" \"$STELLA_DEFERRED_DELETE_HELPER\" \"$@\"; }; cd /Users/rahulnanda/Stella/desktop && bunx vite --port 5210",
+            root,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_match_rejects_unrelated_or_ambiguous_commands() {
+        let root = "/Users/rahulnanda/Stella";
+
+        assert!(!unix_process_command_matches_install(
+            "/Applications/Stella.app/Contents/MacOS/Stella",
+            root,
+        ));
+        assert!(!unix_process_command_matches_install(
+            "rg /Users/rahulnanda/Stella /Users/rahulnanda/projects/stella",
+            root,
+        ));
+        assert!(!unix_process_command_matches_install(
+            "node /Users/rahulnanda/StellaWebsite/node_modules/.bin/vite",
+            root,
+        ));
+        assert!(!unix_process_command_matches_install(
+            "node /Users/rahulnanda/Stella-backup/node_modules/.bin/vite",
+            root,
+        ));
+        assert!(!unix_process_command_matches_install(
+            "/bin/bash -lc cd /Users/rahulnanda/Other && echo /Users/rahulnanda/Stella/desktop",
+            root,
+        ));
+    }
 }
 
 #[tauri::command]
