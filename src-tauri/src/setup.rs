@@ -408,6 +408,41 @@ fn parakeet_helper_of(d: &str) -> PathBuf {
         .join("darwin")
         .join("parakeet_transcriber")
 }
+
+// parakeet.cpp local dictation (Windows + Intel macOS). The CoreML helper above
+// covers Apple Silicon. Keep these in sync with desktop/electron/dictation/
+// local-parakeet.ts (model file, URL, sha256, size).
+const PARAKEET_CPP_MODEL_FILE: &str = "tdt-0.6b-v3-q8_0.gguf";
+const PARAKEET_CPP_MODEL_URL: &str =
+    "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/main/tdt-0.6b-v3-q8_0.gguf";
+const PARAKEET_CPP_MODEL_SHA256: &str =
+    "4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757";
+const PARAKEET_CPP_MODEL_SIZE: u64 = 940_663_680;
+
+fn parakeet_cpp_supported() -> bool {
+    cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        || cfg!(all(target_os = "macos", target_arch = "x86_64"))
+}
+fn parakeet_cpp_helper_of(d: &str) -> PathBuf {
+    let name = if cfg!(target_os = "windows") {
+        "parakeet_cpp_transcriber.exe"
+    } else {
+        "parakeet_cpp_transcriber"
+    };
+    native_helpers_dir_of(d).join(name)
+}
+fn parakeet_cpp_model_dir_of(d: &str) -> PathBuf {
+    desktop_dir_of(d).join("resources").join("parakeet-cpp")
+}
+fn parakeet_cpp_model_path_of(d: &str) -> PathBuf {
+    parakeet_cpp_model_dir_of(d).join(PARAKEET_CPP_MODEL_FILE)
+}
+async fn parakeet_cpp_model_present(target: &Path) -> bool {
+    match fs::metadata(target).await {
+        Ok(meta) => meta.len() == PARAKEET_CPP_MODEL_SIZE,
+        Err(_) => false,
+    }
+}
 fn dugite_git_root_of(d: &str) -> PathBuf {
     node_modules_of(d).join("dugite").join("git")
 }
@@ -1297,9 +1332,18 @@ async fn ensure_mac_screen_capture_permissions_built(install_dir: &str) -> Resul
 }
 
 async fn ensure_parakeet_model_downloaded(install_dir: &str) -> Result<(), String> {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        return Ok(());
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return ensure_parakeet_coreml_model_downloaded(install_dir).await;
     }
+    if parakeet_cpp_supported() {
+        return ensure_parakeet_cpp_model_downloaded(install_dir).await;
+    }
+    Ok(())
+}
+
+// Apple Silicon: the Swift/CoreML helper downloads its own model (FluidAudio)
+// into resources/parakeet via `--download`.
+async fn ensure_parakeet_coreml_model_downloaded(install_dir: &str) -> Result<(), String> {
     let helper = parakeet_helper_of(install_dir);
     if !path_exists(&helper).await {
         log_install(
@@ -1331,6 +1375,72 @@ async fn ensure_parakeet_model_downloaded(install_dir: &str) -> Result<(), Strin
         };
         Err(format!("Parakeet model download failed: {detail}"))
     }
+}
+
+// Windows + Intel macOS: parakeet.cpp reads a GGUF we fetch directly into
+// resources/parakeet-cpp (the helper itself never touches the network).
+async fn ensure_parakeet_cpp_model_downloaded(install_dir: &str) -> Result<(), String> {
+    let helper = parakeet_cpp_helper_of(install_dir);
+    if !path_exists(&helper).await {
+        log_install(
+            install_dir,
+            "Skipping Parakeet model download because the local dictation helper is not present.",
+        )
+        .await;
+        return Ok(());
+    }
+    let target = parakeet_cpp_model_path_of(install_dir);
+    if parakeet_cpp_model_present(&target).await {
+        return Ok(());
+    }
+    let dir = parakeet_cpp_model_dir_of(install_dir);
+    fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Failed to prepare Parakeet model cache: {e}"))?;
+    log_install(install_dir, "Downloading local Parakeet dictation model").await;
+
+    let tmp = dir.join(format!("{PARAKEET_CPP_MODEL_FILE}.part"));
+    let _ = fs::remove_file(&tmp).await;
+    let client = download_client()?;
+    let mut response = client
+        .get(PARAKEET_CPP_MODEL_URL)
+        .header("User-Agent", "stella-launcher")
+        .send()
+        .await
+        .map_err(|e| format!("Parakeet model download failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Parakeet model download failed ({}).",
+            response.status()
+        ));
+    }
+    {
+        let mut file = fs::File::create(&tmp)
+            .await
+            .map_err(|e| format!("Failed to create Parakeet model download: {e}"))?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("Failed to read Parakeet model download: {e}"))?
+        {
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Failed to write Parakeet model download: {e}"))?;
+        }
+        file.flush()
+            .await
+            .map_err(|e| format!("Failed to finish Parakeet model download: {e}"))?;
+    }
+
+    let digest = sha256_file_digest(&tmp).await?;
+    if let Err(err) = verify_sha256_digest(digest, PARAKEET_CPP_MODEL_SHA256) {
+        let _ = fs::remove_file(&tmp).await;
+        return Err(err);
+    }
+    fs::rename(&tmp, &target)
+        .await
+        .map_err(|e| format!("Failed to finalize Parakeet model: {e}"))?;
+    Ok(())
 }
 
 async fn ripgrep_private_binary_exists() -> bool {
@@ -2721,26 +2831,40 @@ async fn parakeet_step_complete(dir: &str) -> bool {
 }
 
 async fn parakeet_step_check(dir: &str) -> StepCheck {
-    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        return StepCheck::complete();
-    }
-    if !path_exists(&parakeet_helper_of(dir)).await {
-        // Local dictation is optional. Before the payload lands, keep the step
-        // pending so install can run; after payload is present, do not block
-        // launch on a missing native helper.
-        return if payload_step_complete(dir).await {
+    // Local dictation is optional everywhere. Before the payload lands, keep the
+    // step pending so install can run; after payload is present, never block
+    // launch on a missing native helper or model.
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        if !path_exists(&parakeet_helper_of(dir)).await {
+            return if payload_step_complete(dir).await {
+                StepCheck::complete()
+            } else {
+                StepCheck::incomplete_silent()
+            };
+        }
+        return if path_exists(&parakeet_cache_dir_of(dir).join("FluidAudio")).await
+            || path_exists(&parakeet_cache_dir_of(dir).join("fluidaudio")).await
+        {
             StepCheck::complete()
         } else {
             StepCheck::incomplete_silent()
         };
     }
-    if path_exists(&parakeet_cache_dir_of(dir).join("FluidAudio")).await
-        || path_exists(&parakeet_cache_dir_of(dir).join("fluidaudio")).await
-    {
-        StepCheck::complete()
-    } else {
-        StepCheck::incomplete_silent()
+    if parakeet_cpp_supported() {
+        if !path_exists(&parakeet_cpp_helper_of(dir)).await {
+            return if payload_step_complete(dir).await {
+                StepCheck::complete()
+            } else {
+                StepCheck::incomplete_silent()
+            };
+        }
+        return if parakeet_cpp_model_present(&parakeet_cpp_model_path_of(dir)).await {
+            StepCheck::complete()
+        } else {
+            StepCheck::incomplete_silent()
+        };
     }
+    StepCheck::complete()
 }
 
 async fn install_step(
@@ -3623,10 +3747,12 @@ mod tests {
         let complete =
             tauri::async_runtime::block_on(parakeet_step_complete(&dir.path.to_string_lossy()));
 
-        assert_eq!(
-            complete,
-            !cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        );
+        // The Parakeet step stays pending before the payload lands on every
+        // platform that ships a local dictation engine (Apple Silicon CoreML or
+        // parakeet.cpp on Windows / Intel macOS); elsewhere it is a no-op.
+        let parakeet_platform =
+            cfg!(all(target_os = "macos", target_arch = "aarch64")) || parakeet_cpp_supported();
+        assert_eq!(complete, !parakeet_platform);
     }
 
     #[test]
