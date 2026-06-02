@@ -635,6 +635,7 @@ struct DesktopReleaseManifest {
     #[serde(default)]
     commit: Option<String>,
     #[allow(dead_code)]
+    #[serde(default)]
     files: HashMap<String, ReleaseFileEntry>,
 }
 
@@ -2120,9 +2121,7 @@ async fn download_archive_with_resume(
                 last_err = Some(format!("{item_label} download failed: {err}"));
                 log_install(
                     install_dir,
-                    &format!(
-                        "{item_label} download connection failed on attempt {attempt}: {err}"
-                    ),
+                    &format!("{item_label} download connection failed on attempt {attempt}: {err}"),
                 )
                 .await;
                 if attempt < DOWNLOAD_RETRY_ATTEMPTS {
@@ -2219,8 +2218,7 @@ async fn download_archive_with_resume(
                     )
                 };
                 let progress = response_total.filter(|total| *total > 0).map(|total| {
-                    progress_start
-                        + ((downloaded as f64 / total as f64).min(1.0) * progress_span)
+                    progress_start + ((downloaded as f64 / total as f64).min(1.0) * progress_span)
                 });
                 set_step_progress(state, app, &step_id, detail, progress);
                 last_emit = std::time::Instant::now();
@@ -2636,10 +2634,6 @@ fn build_step_defs() -> Vec<StepDef> {
             label: "Downloading Stella",
         },
         StepDef {
-            id: SetupStepId::NativeHelpers,
-            label: "Installing native helpers",
-        },
-        StepDef {
             id: SetupStepId::Parakeet,
             label: "Preparing local dictation",
         },
@@ -2661,7 +2655,7 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
             }
         }
         SetupStepId::Payload => payload_step_check(dir).await,
-        SetupStepId::NativeHelpers => native_helpers_step_check(dir).await,
+        SetupStepId::NativeHelpers => StepCheck::complete(),
         SetupStepId::Parakeet => parakeet_step_check(dir).await,
         SetupStepId::Finalize => {
             if state.dev_mode || valid_install_manifest_exists(dir).await {
@@ -2688,22 +2682,7 @@ async fn payload_step_check(dir: &str) -> StepCheck {
     if !looks_like_stella_source_tree(Path::new(dir)) {
         return StepCheck::incomplete("The selected folder is not a Stella desktop install.");
     }
-    let Ok(manifest) = read_release_manifest(dir).await else {
-        return StepCheck::incomplete_silent();
-    };
-    if manifest.files.is_empty() {
-        return StepCheck::incomplete_silent();
-    }
-    for relative_path in manifest.files.keys() {
-        if !path_exists(&Path::new(dir).join(relative_path)).await {
-            return StepCheck::incomplete("App files need repair.");
-        }
-    }
     StepCheck::complete()
-}
-
-async fn native_helpers_step_complete(dir: &str) -> bool {
-    native_helpers_step_check(dir).await.complete
 }
 
 async fn native_helpers_step_check(dir: &str) -> StepCheck {
@@ -2746,9 +2725,10 @@ async fn parakeet_step_check(dir: &str) -> StepCheck {
         return StepCheck::complete();
     }
     if !path_exists(&parakeet_helper_of(dir)).await {
-        // Helper hasn't been delivered yet (payload + native helpers still to
-        // run), so report not-complete to allow the parakeet step to run later.
-        return if native_helpers_step_complete(dir).await && payload_step_complete(dir).await {
+        // Local dictation is optional. Before the payload lands, keep the step
+        // pending so install can run; after payload is present, do not block
+        // launch on a missing native helper.
+        return if payload_step_complete(dir).await {
             StepCheck::complete()
         } else {
             StepCheck::incomplete_silent()
@@ -2880,7 +2860,6 @@ async fn refresh_derived(state: &mut InstallerState, ctx: &InstallerContext) {
     } else {
         valid_install_manifest_exists(&state.install_path).await
             && payload_step_complete(&state.install_path).await
-            && native_helpers_step_complete(&state.install_path).await
     };
     state.warning_message = None;
 }
@@ -3572,8 +3551,8 @@ mod tests {
     }
 
     #[test]
-    fn payload_completion_rejects_missing_manifest_files() {
-        let dir = TestDir::new("partial-payload");
+    fn payload_completion_accepts_stale_or_ahead_release_manifest() {
+        let dir = TestDir::new("stale-release-manifest");
         write_install_shape(&dir.path);
         write_dependency_shape(&dir.path);
         write_release_manifest(&dir.path, &["desktop/package.json", "runtime/missing.txt"]);
@@ -3581,8 +3560,8 @@ mod tests {
 
         let check = tauri::async_runtime::block_on(payload_step_check(&dir.path.to_string_lossy()));
 
-        assert!(!check.complete);
-        assert_eq!(check.reason.as_deref(), Some("App files need repair."));
+        assert!(check.complete);
+        assert_eq!(check.reason, None);
     }
 
     #[test]
