@@ -44,6 +44,7 @@ const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOWS_REMOVE_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const WINDOWS_REMOVE_RETRY_POLL: Duration = Duration::from_millis(250);
+const RIPGREP_VERSION: &str = "15.1.0";
 
 fn release_tarball_name() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
@@ -64,6 +65,34 @@ fn native_helpers_platform_dir() -> &'static str {
         "darwin"
     } else {
         "linux"
+    }
+}
+
+fn ripgrep_platform_asset() -> Option<(&'static str, &'static str)> {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some(("x86_64-pc-windows-msvc", "zip"))
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some(("aarch64-pc-windows-msvc", "zip"))
+    } else if cfg!(all(target_os = "windows", target_arch = "x86")) {
+        Some(("i686-pc-windows-msvc", "zip"))
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some(("aarch64-apple-darwin", "tar.gz"))
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some(("x86_64-apple-darwin", "tar.gz"))
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some(("aarch64-unknown-linux-gnu", "tar.gz"))
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(("x86_64-unknown-linux-musl", "tar.gz"))
+    } else {
+        None
+    }
+}
+
+fn ripgrep_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "rg.exe"
+    } else {
+        "rg"
     }
 }
 
@@ -306,6 +335,12 @@ fn bun_executable_of() -> PathBuf {
 fn bun_bin_dir() -> PathBuf {
     home_dir().join(".bun").join("bin")
 }
+fn stella_private_bin_dir() -> PathBuf {
+    stella_home_dir().join("bin")
+}
+fn ripgrep_private_binary_path() -> PathBuf {
+    stella_private_bin_dir().join(ripgrep_executable_name())
+}
 fn path_separator() -> &'static str {
     if cfg!(target_os = "windows") {
         ";"
@@ -416,6 +451,11 @@ pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
     let mut env = HashMap::new();
     let mut launch_path =
         prepend_path_entry(&bun_bin_dir(), &std::env::var("PATH").unwrap_or_default());
+    launch_path = prepend_path_entry(&stella_private_bin_dir(), &launch_path);
+    env.insert(
+        "STELLA_HOME".into(),
+        stella_home_dir().to_string_lossy().to_string(),
+    );
     let git_root = dugite_git_root_of(install_dir);
     if !git_root.exists() {
         env.insert("PATH".into(), launch_path);
@@ -737,6 +777,9 @@ async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> Stri
         if let Some(git_exec_path) = launch_env.get("GIT_EXEC_PATH") {
             content.push_str(&format!("set \"GIT_EXEC_PATH={git_exec_path}\"\r\n"));
         }
+        if let Some(stella_home) = launch_env.get("STELLA_HOME") {
+            content.push_str(&format!("set \"STELLA_HOME={stella_home}\"\r\n"));
+        }
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("set \"PATH={path_value}\"\r\n"));
         }
@@ -764,6 +807,9 @@ async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> Stri
         }
         if let Some(git_template_dir) = launch_env.get("GIT_TEMPLATE_DIR") {
             content.push_str(&format!("export GIT_TEMPLATE_DIR=\"{git_template_dir}\"\n"));
+        }
+        if let Some(stella_home) = launch_env.get("STELLA_HOME") {
+            content.push_str(&format!("export STELLA_HOME=\"{stella_home}\"\n"));
         }
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("export PATH=\"{path_value}\"\n"));
@@ -1284,6 +1330,182 @@ async fn ensure_parakeet_model_downloaded(install_dir: &str) -> Result<(), Strin
         };
         Err(format!("Parakeet model download failed: {detail}"))
     }
+}
+
+async fn ripgrep_private_binary_exists() -> bool {
+    path_exists(&ripgrep_private_binary_path()).await
+}
+
+async fn download_ripgrep_archive(target: &Path, url: &str) -> Result<(), String> {
+    let client = download_client()?;
+    let mut response = client
+        .get(url)
+        .header("User-Agent", "stella-launcher")
+        .send()
+        .await
+        .map_err(|e| format!("Ripgrep download failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Ripgrep download failed ({}).", response.status()));
+    }
+
+    let mut file = fs::File::create(target)
+        .await
+        .map_err(|e| format!("Failed to create ripgrep download: {e}"))?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed to read ripgrep download: {e}"))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("Failed to write ripgrep download: {e}"))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("Failed to finish ripgrep download: {e}"))?;
+    Ok(())
+}
+
+fn powershell_single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+async fn extract_ripgrep_archive(
+    archive_path: &Path,
+    extract_dir: &Path,
+    extension: &str,
+) -> Result<(), String> {
+    if extension == "zip" {
+        let archive = archive_path.to_string_lossy().to_string();
+        let destination = extract_dir.to_string_lossy().to_string();
+        let script = format!(
+            "$global:ProgressPreference = 'SilentlyContinue'; Expand-Archive -LiteralPath {} -DestinationPath {} -Force",
+            powershell_single_quoted(&archive),
+            powershell_single_quoted(&destination),
+        );
+        let result = run(
+            &[
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ],
+            None,
+        )
+        .await;
+        if result.ok {
+            return Ok(());
+        }
+        let fallback = run(
+            &[
+                "pwsh.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ],
+            None,
+        )
+        .await;
+        if fallback.ok {
+            return Ok(());
+        }
+        return Err(run_failure_summary(
+            &fallback,
+            "Could not extract ripgrep archive.",
+        ));
+    }
+
+    let archive = archive_path.to_string_lossy().to_string();
+    let destination = extract_dir.to_string_lossy().to_string();
+    let result = run(&["tar", "-xzf", &archive, "-C", &destination], None).await;
+    if result.ok {
+        Ok(())
+    } else {
+        Err(run_failure_summary(
+            &result,
+            "Could not extract ripgrep archive.",
+        ))
+    }
+}
+
+async fn ensure_ripgrep_provisioned(install_dir: &str) -> Result<(), String> {
+    let target = ripgrep_private_binary_path();
+    if path_exists(&target).await {
+        log_install(
+            install_dir,
+            "Ripgrep already available in Stella private bin",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let Some((platform, extension)) = ripgrep_platform_asset() else {
+        log_install(
+            install_dir,
+            "Skipping ripgrep provisioning on unsupported platform",
+        )
+        .await;
+        return Ok(());
+    };
+
+    let bin_dir = stella_private_bin_dir();
+    fs::create_dir_all(&bin_dir)
+        .await
+        .map_err(|e| format!("Failed to create Stella private bin: {e}"))?;
+
+    let filename = format!("ripgrep-{RIPGREP_VERSION}-{platform}.{extension}");
+    let url = format!(
+        "https://github.com/BurntSushi/ripgrep/releases/download/{RIPGREP_VERSION}/{filename}"
+    );
+    let archive_path = bin_dir.join(&filename);
+    let extract_dir = bin_dir.join(format!("ripgrep-{RIPGREP_VERSION}-extract"));
+
+    log_install(install_dir, &format!("Downloading ripgrep from {url}")).await;
+    let result = async {
+        let _ = fs::remove_dir_all(&extract_dir).await;
+        fs::create_dir_all(&extract_dir)
+            .await
+            .map_err(|e| format!("Failed to prepare ripgrep extract dir: {e}"))?;
+        download_ripgrep_archive(&archive_path, &url).await?;
+        extract_ripgrep_archive(&archive_path, &extract_dir, extension).await?;
+
+        let extracted = extract_dir
+            .join(format!("ripgrep-{RIPGREP_VERSION}-{platform}"))
+            .join(ripgrep_executable_name());
+        if !path_exists(&extracted).await {
+            return Err("Ripgrep archive did not contain the expected executable.".to_string());
+        }
+        fs::copy(&extracted, &target)
+            .await
+            .map_err(|e| format!("Failed to install ripgrep: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&target)
+                .await
+                .map_err(|e| format!("Failed to inspect ripgrep permissions: {e}"))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&target, perms)
+                .await
+                .map_err(|e| format!("Failed to mark ripgrep executable: {e}"))?;
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = fs::remove_file(&archive_path).await;
+    let _ = fs::remove_dir_all(&extract_dir).await;
+
+    result?;
+    log_install(
+        install_dir,
+        &format!("Ripgrep installed to {}", target.to_string_lossy()),
+    )
+    .await;
+    Ok(())
 }
 
 // ── Tarball download + extract ──────────────────────────────────────
@@ -2582,6 +2804,9 @@ async fn install_step(
             Ok(())
         }
         SetupStepId::Finalize => {
+            if let Err(err) = ensure_ripgrep_provisioned(&dir).await {
+                log_install(&dir, &format!("Ripgrep install warning: {err}")).await;
+            }
             let script_path = write_launch_script(&dir, state.low_resource_mode).await;
             let release_manifest = read_release_manifest(&dir).await.ok();
 
@@ -2907,6 +3132,9 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
 
     prune_legacy_split_dirs(dir).await;
     schedule_git_repo_init(dir.clone());
+    if !ripgrep_private_binary_exists().await {
+        let _ = ensure_ripgrep_provisioned(dir).await;
+    }
 
     let mut env = dugite_launch_env(dir);
     if let Ok(exe) = std::env::current_exe() {
@@ -3062,6 +3290,26 @@ mod tests {
     fn write_dependency_shape(path: &Path) {
         fs::create_dir_all(path.join("node_modules").join("electron").join("dist"))
             .expect("create bundled dependencies");
+    }
+
+    #[test]
+    fn launch_env_prepends_stella_private_bin() {
+        let dir = TestDir::new("launch-env-bin");
+        let env = dugite_launch_env(&dir.path.to_string_lossy());
+        let path_value = env.get("PATH").expect("PATH env");
+        let first_entry = path_value
+            .split(path_separator())
+            .next()
+            .expect("first PATH entry");
+
+        assert_eq!(
+            first_entry,
+            stella_private_bin_dir().to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            env.get("STELLA_HOME").map(String::as_str),
+            Some(stella_home_dir().to_string_lossy().as_ref())
+        );
     }
 
     fn write_release_manifest(path: &Path, files: &[&str]) {
@@ -3279,7 +3527,18 @@ mod tests {
         let dir = TestDir::new("launch-env");
         let env = dugite_launch_env(&dir.path.to_string_lossy());
         let path = env.get("PATH").expect("PATH env");
-        assert!(path.starts_with(&bun_bin_dir().to_string_lossy().to_string()));
+        let entries = path
+            .split(path_separator())
+            .take(2)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                stella_private_bin_dir().to_string_lossy().to_string(),
+                bun_bin_dir().to_string_lossy().to_string()
+            ]
+        );
     }
 
     #[test]
