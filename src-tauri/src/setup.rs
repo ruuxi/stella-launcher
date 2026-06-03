@@ -38,7 +38,6 @@ const DEFAULT_NATIVE_HELPERS_MANIFEST_URL: &str =
 const DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/native-helpers";
 const INSTALL_DIR_NAME: &str = "stella";
-const ELECTRON_USER_DATA_DIR_NAME: &str = "electron-user-data";
 const DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -254,19 +253,10 @@ fn is_directory_empty(path: &Path) -> bool {
     }
 }
 
-fn is_state_only_install_dir(path: &Path) -> bool {
-    is_recoverable_launcher_install_dir(path, true)
-}
-
 fn is_partial_launcher_install_dir(path: &Path) -> bool {
-    is_recoverable_launcher_install_dir(path, false)
-}
-
-fn is_recoverable_launcher_install_dir(path: &Path, require_state: bool) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
     };
-    let mut saw_state = false;
     let mut saw_launcher_artifact = false;
     for entry in entries {
         let Ok(entry) = entry else {
@@ -276,15 +266,8 @@ fn is_recoverable_launcher_install_dir(path: &Path, require_state: bool) -> bool
         let Ok(file_type) = entry.file_type() else {
             return false;
         };
-        if name == "state" {
-            if !file_type.is_dir() {
-                return false;
-            }
-            saw_state = true;
-            continue;
-        }
-        // Launcher/macOS-owned artifacts that are safe to allow alongside
-        // preserved state after uninstall.
+        // Launcher/macOS-owned artifacts left behind by a partial or failed
+        // install that are safe to clean up.
         if file_type.is_file()
             && (name == "stella-install.log"
                 || name == ".DS_Store"
@@ -296,15 +279,13 @@ fn is_recoverable_launcher_install_dir(path: &Path, require_state: bool) -> bool
         }
         return false;
     }
-    saw_state || (!require_state && saw_launcher_artifact)
+    saw_launcher_artifact
 }
 
 pub fn is_uninstallable_install_path(install_path: &str) -> bool {
     let path = Path::new(install_path);
     path.is_dir()
-        && (looks_like_stella_install_dir(path)
-            || is_state_only_install_dir(path)
-            || is_partial_launcher_install_dir(path))
+        && (looks_like_stella_install_dir(path) || is_partial_launcher_install_dir(path))
 }
 
 fn manifest_of(d: &str) -> PathBuf {
@@ -567,7 +548,6 @@ fn location_error(p: &str) -> Option<String> {
         }
         if !looks_like_stella_install_dir(&pb)
             && !is_directory_empty(&pb)
-            && !is_state_only_install_dir(&pb)
             && !is_partial_launcher_install_dir(&pb)
         {
             return Some(format!(
@@ -1769,21 +1749,6 @@ async fn download_and_extract_release(
             .map_err(|e| format!("tar read failed: {e}"))?
         {
             let mut entry = entry.map_err(|e| format!("tar entry read failed: {e}"))?;
-            let relative_path = entry
-                .path()
-                .map_err(|e| format!("tar entry path failed: {e}"))?
-                .to_path_buf();
-            let is_state_entry = relative_path
-                .components()
-                .find_map(|component| match component {
-                    std::path::Component::Normal(value) => Some(value == "state"),
-                    _ => None,
-                })
-                .unwrap_or(false);
-            let target_path = Path::new(&install_path).join(&relative_path);
-            if is_state_entry && target_path.exists() {
-                continue;
-            }
             entry
                 .unpack_in(&install_path)
                 .map_err(|e| format!("tar extract failed: {e}"))?;
@@ -2003,18 +1968,10 @@ async fn download_and_extract_native_helpers(
     Ok(())
 }
 
-async fn remove_install_files_preserving_state(install_path: &str) -> Result<(), String> {
-    let electron_user_data_path = Path::new(install_path)
-        .join("state")
-        .join(ELECTRON_USER_DATA_DIR_NAME);
-    if path_exists(&electron_user_data_path).await {
-        remove_dir_all_tolerating_windows_lock(
-            &electron_user_data_path,
-            "Failed to remove Stella app startup data",
-        )
-        .await?;
-    }
-
+async fn remove_install_files(install_path: &str) -> Result<(), String> {
+    // Durable user data lives in `~/.stella` (set as STELLA_HOME on launch),
+    // outside the install tree, so uninstall removes every install entry and
+    // leaves the durable home untouched.
     let mut entries = fs::read_dir(install_path)
         .await
         .map_err(|e| format!("Failed to read Stella install directory: {e}"))?;
@@ -2023,9 +1980,6 @@ async fn remove_install_files_preserving_state(install_path: &str) -> Result<(),
         .await
         .map_err(|e| format!("Failed to read Stella install entry: {e}"))?
     {
-        if entry.file_name() == "state" {
-            continue;
-        }
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -3264,7 +3218,7 @@ pub async fn uninstall(state: &mut InstallerState) -> Result<(), String> {
             state.error_message = Some(msg.clone());
             return Err(msg);
         }
-        remove_install_files_preserving_state(&state.install_path).await?;
+        remove_install_files(&state.install_path).await?;
     }
 
     remove_registry().await;
@@ -3511,28 +3465,6 @@ mod tests {
     }
 
     #[test]
-    fn location_error_allows_state_only_install_dirs() {
-        let dir = TestDir::new("state-only");
-        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
-        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
-
-        assert_eq!(location_error(&dir.path.to_string_lossy()), None);
-    }
-
-    #[test]
-    fn location_error_allows_state_only_install_dirs_with_benign_leftovers() {
-        let dir = TestDir::new("state-only-leftovers");
-        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
-        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
-        fs::write(dir.path.join(".DS_Store"), "").expect("write ds store");
-        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
-        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
-            .expect("write temp archive");
-
-        assert_eq!(location_error(&dir.path.to_string_lossy()), None);
-    }
-
-    #[test]
     fn location_error_allows_partial_launcher_download_dirs() {
         let dir = TestDir::new("partial-download");
         fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
@@ -3557,28 +3489,6 @@ mod tests {
         write_generic_package_shape(&dir.path);
 
         assert!(!is_uninstallable_install_path(&dir.path.to_string_lossy()));
-    }
-
-    #[test]
-    fn uninstallable_install_path_allows_state_only_stella_dirs() {
-        let dir = TestDir::new("uninstallable-state-only");
-        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
-        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
-
-        assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
-    }
-
-    #[test]
-    fn uninstallable_install_path_allows_state_only_stella_dirs_with_benign_leftovers() {
-        let dir = TestDir::new("uninstallable-state-only-leftovers");
-        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
-        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
-        fs::write(dir.path.join(".DS_Store"), "").expect("write ds store");
-        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
-        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
-            .expect("write temp archive");
-
-        assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
     }
 
     #[test]
@@ -3772,41 +3682,23 @@ mod tests {
     }
 
     #[test]
-    fn remove_install_files_preserving_state_keeps_state_only() {
-        let dir = TestDir::new("preserve-state");
+    fn remove_install_files_removes_entire_install_tree() {
+        let dir = TestDir::new("remove-install");
         write_install_shape(&dir.path);
+        // A legacy `<install>/state` dir (from before durable data moved to
+        // `~/.stella`) must also be removed — nothing in the install tree is
+        // preserved anymore.
         fs::create_dir_all(dir.path.join("state")).expect("create state dir");
-        fs::create_dir_all(
-            dir.path
-                .join("state")
-                .join(ELECTRON_USER_DATA_DIR_NAME)
-                .join("session-data"),
-        )
-        .expect("create electron user data dir");
         fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
-        fs::write(
-            dir.path
-                .join("state")
-                .join(ELECTRON_USER_DATA_DIR_NAME)
-                .join("Local Storage"),
-            "local storage",
-        )
-        .expect("write electron user data file");
         fs::write(dir.path.join("launch.sh"), "#!/bin/sh\n").expect("write launch script");
 
-        tauri::async_runtime::block_on(remove_install_files_preserving_state(
-            &dir.path.to_string_lossy(),
-        ))
-        .expect("remove install files");
+        tauri::async_runtime::block_on(remove_install_files(&dir.path.to_string_lossy()))
+            .expect("remove install files");
 
         assert!(dir.path.exists());
-        assert!(dir.path.join("state").join("stella.sqlite").exists());
-        assert!(!dir
-            .path
-            .join("state")
-            .join(ELECTRON_USER_DATA_DIR_NAME)
-            .exists());
+        assert!(!dir.path.join("state").exists());
         assert!(!dir.path.join("desktop").exists());
+        assert!(!dir.path.join("runtime").exists());
         assert!(!dir.path.join("package.json").exists());
         assert!(!dir.path.join("launch.sh").exists());
     }

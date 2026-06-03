@@ -179,7 +179,7 @@ fn perform_windows_uninstall(install_root: Option<&Path>) -> Result<(), String> 
                 );
             }
             commands::stop_desktop_by_path(&install_root_str);
-            remove_install_files_preserving_state_sync(root)?;
+            remove_install_files_sync(root)?;
         }
     }
 
@@ -190,20 +190,13 @@ fn perform_windows_uninstall(install_root: Option<&Path>) -> Result<(), String> 
 }
 
 #[cfg(target_os = "windows")]
-fn remove_install_files_preserving_state_sync(root: &Path) -> Result<(), String> {
-    let electron_user_data_path = root.join("state").join("electron-user-data");
-    if electron_user_data_path.exists() {
-        std::fs::remove_dir_all(&electron_user_data_path)
-            .map_err(|e| format!("Failed to remove Stella app startup data: {e}"))?;
-    }
-
+fn remove_install_files_sync(root: &Path) -> Result<(), String> {
+    // Durable user data lives in `~/.stella` (STELLA_HOME), outside the install
+    // tree, so uninstall removes every install entry and leaves it untouched.
     for entry in std::fs::read_dir(root)
         .map_err(|e| format!("Failed to read Stella install directory: {e}"))?
     {
         let entry = entry.map_err(|e| format!("Failed to read Stella install entry: {e}"))?;
-        if entry.file_name() == "state" {
-            continue;
-        }
         let path = entry.path();
         let file_type = entry
             .file_type()
