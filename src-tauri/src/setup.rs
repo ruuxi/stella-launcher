@@ -253,6 +253,41 @@ fn is_directory_empty(path: &Path) -> bool {
     }
 }
 
+fn is_state_only_install_dir(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let mut saw_state = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if name == "state" {
+            if !file_type.is_dir() {
+                return false;
+            }
+            saw_state = true;
+            continue;
+        }
+        // Launcher/macOS-owned artifacts that are safe to allow alongside
+        // legacy preserved state after uninstall.
+        if file_type.is_file()
+            && (name == "stella-install.log"
+                || name == ".DS_Store"
+                || name == ".stella-desktop-download.tar.zst"
+                || name == ".stella-native-helpers-download.tar.zst")
+        {
+            continue;
+        }
+        return false;
+    }
+    saw_state
+}
+
 fn is_partial_launcher_install_dir(path: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(path) else {
         return false;
@@ -285,7 +320,9 @@ fn is_partial_launcher_install_dir(path: &Path) -> bool {
 pub fn is_uninstallable_install_path(install_path: &str) -> bool {
     let path = Path::new(install_path);
     path.is_dir()
-        && (looks_like_stella_install_dir(path) || is_partial_launcher_install_dir(path))
+        && (looks_like_stella_install_dir(path)
+            || is_state_only_install_dir(path)
+            || is_partial_launcher_install_dir(path))
 }
 
 fn manifest_of(d: &str) -> PathBuf {
@@ -548,6 +585,7 @@ fn location_error(p: &str) -> Option<String> {
         }
         if !looks_like_stella_install_dir(&pb)
             && !is_directory_empty(&pb)
+            && !is_state_only_install_dir(&pb)
             && !is_partial_launcher_install_dir(&pb)
         {
             return Some(format!(
@@ -1970,8 +2008,10 @@ async fn download_and_extract_native_helpers(
 
 async fn remove_install_files(install_path: &str) -> Result<(), String> {
     // Durable user data lives in `~/.stella` (set as STELLA_HOME on launch),
-    // outside the install tree, so uninstall removes every install entry and
-    // leaves the durable home untouched.
+    // outside the install tree. Some older installs still have a legacy
+    // `<install>/state` directory, which may contain Windows-owned files or
+    // old ACLs; preserve it on normal uninstall so those users can reinstall
+    // instead of getting stuck on access-denied cleanup.
     let mut entries = fs::read_dir(install_path)
         .await
         .map_err(|e| format!("Failed to read Stella install directory: {e}"))?;
@@ -1980,6 +2020,9 @@ async fn remove_install_files(install_path: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to read Stella install entry: {e}"))?
     {
+        if entry.file_name() == "state" {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry
             .file_type()
@@ -3465,6 +3508,28 @@ mod tests {
     }
 
     #[test]
+    fn location_error_allows_state_only_install_dirs() {
+        let dir = TestDir::new("state-only");
+        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
+        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
+
+        assert_eq!(location_error(&dir.path.to_string_lossy()), None);
+    }
+
+    #[test]
+    fn location_error_allows_state_only_install_dirs_with_benign_leftovers() {
+        let dir = TestDir::new("state-only-leftovers");
+        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
+        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
+        fs::write(dir.path.join(".DS_Store"), "").expect("write ds store");
+        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
+        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
+            .expect("write temp archive");
+
+        assert_eq!(location_error(&dir.path.to_string_lossy()), None);
+    }
+
+    #[test]
     fn location_error_allows_partial_launcher_download_dirs() {
         let dir = TestDir::new("partial-download");
         fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
@@ -3489,6 +3554,28 @@ mod tests {
         write_generic_package_shape(&dir.path);
 
         assert!(!is_uninstallable_install_path(&dir.path.to_string_lossy()));
+    }
+
+    #[test]
+    fn uninstallable_install_path_allows_state_only_stella_dirs() {
+        let dir = TestDir::new("uninstallable-state-only");
+        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
+        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
+
+        assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
+    }
+
+    #[test]
+    fn uninstallable_install_path_allows_state_only_stella_dirs_with_benign_leftovers() {
+        let dir = TestDir::new("uninstallable-state-only-leftovers");
+        fs::create_dir_all(dir.path.join("state")).expect("create state dir");
+        fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
+        fs::write(dir.path.join(".DS_Store"), "").expect("write ds store");
+        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
+        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
+            .expect("write temp archive");
+
+        assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
     }
 
     #[test]
@@ -3682,12 +3769,9 @@ mod tests {
     }
 
     #[test]
-    fn remove_install_files_removes_entire_install_tree() {
+    fn remove_install_files_preserves_legacy_state() {
         let dir = TestDir::new("remove-install");
         write_install_shape(&dir.path);
-        // A legacy `<install>/state` dir (from before durable data moved to
-        // `~/.stella`) must also be removed — nothing in the install tree is
-        // preserved anymore.
         fs::create_dir_all(dir.path.join("state")).expect("create state dir");
         fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
         fs::write(dir.path.join("launch.sh"), "#!/bin/sh\n").expect("write launch script");
@@ -3696,7 +3780,7 @@ mod tests {
             .expect("remove install files");
 
         assert!(dir.path.exists());
-        assert!(!dir.path.join("state").exists());
+        assert!(dir.path.join("state").join("stella.sqlite").exists());
         assert!(!dir.path.join("desktop").exists());
         assert!(!dir.path.join("runtime").exists());
         assert!(!dir.path.join("package.json").exists());
