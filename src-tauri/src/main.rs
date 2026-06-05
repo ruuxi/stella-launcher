@@ -207,6 +207,15 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // Must be the first plugin: when the user re-launches the Stella
+        // shortcut while a launcher instance is already alive (it stays
+        // resident in the tray while the desktop runs), focus the existing
+        // window instead of spawning a second process. Two processes share
+        // one WebView2 user-data dir for this identifier, which surfaces as
+        // a blank white window + duplicate tray icons.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            commands::show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())

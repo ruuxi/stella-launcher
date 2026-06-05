@@ -736,6 +736,18 @@ pub fn show_main_window(app: &AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+
+        // WebView2 suspends its rendering pipeline while the window is
+        // hidden and frequently comes back blank after `show()` on Windows
+        // (WebView2Feedback #2983 / #4763). A 1px size nudge forces a
+        // relayout + repaint so the launcher UI actually paints instead of
+        // showing an empty white window.
+        #[cfg(target_os = "windows")]
+        if let Ok(size) = window.outer_size() {
+            let nudged = tauri::PhysicalSize::new(size.width.saturating_add(1), size.height);
+            let _ = window.set_size(nudged);
+            let _ = window.set_size(size);
+        }
     }
 
     #[cfg(target_os = "macos")]
