@@ -378,18 +378,149 @@ fn create_shortcuts(exe_path: &Path, _working_dir: &Path) {
 #[cfg(target_os = "windows")]
 fn create_win_lnk(lnk_path: &Path, target: &str) {
     let esc = |s: &str| s.replace('\'', "''");
-    let ps = format!(
-        "$w = New-Object -ComObject WScript.Shell; \
-         $s = $w.CreateShortcut('{}'); \
-         $s.TargetPath = '{}'; \
-         $s.Description = 'Stella AI Assistant'; \
-         $s.Save()",
+    // WScript.Shell creates the shortcut and gives it the launcher exe's icon,
+    // but it cannot set the AppUserModelID. That id is what lets Windows show
+    // Stella's icon (instead of the stock Electron icon) on the running desktop
+    // window's taskbar button: the desktop process declares the same id via
+    // setAppUserModelId("com.stella.app"), and Windows resolves the button's
+    // icon/name from the shortcut whose AppUserModelID matches. We write it
+    // through the shell property store (PKEY_AppUserModel_ID) with a small COM
+    // helper, since the running app ships as a stock electron.exe with no
+    // embedded Stella branding of its own.
+    let header = format!(
+        "$LnkPath = '{}'; $Target = '{}'; $AppId = '{}';\n",
         esc(&lnk_path.to_string_lossy()),
         esc(target),
+        "com.stella.app",
     );
+    let body = r#"
+$w = New-Object -ComObject WScript.Shell
+$s = $w.CreateShortcut($LnkPath)
+$s.TargetPath = $Target
+$s.IconLocation = "$Target,0"
+$s.Description = 'Stella AI Assistant'
+$s.Save()
+
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace StellaShortcut {
+  [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IPersistFile {
+    void GetClassID(out Guid pClassID);
+    [PreserveSig] int IsDirty();
+    void Load([MarshalAs(UnmanagedType.LPWStr)] string fileName, int mode);
+    void Save([MarshalAs(UnmanagedType.LPWStr)] string fileName, [MarshalAs(UnmanagedType.Bool)] bool remember);
+    void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string fileName);
+    void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string fileName);
+  }
+
+  [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IPropertyStore {
+    void GetCount(out uint count);
+    void GetAt(uint index, out PropertyKey key);
+    void GetValue(ref PropertyKey key, out PropVariant value);
+    void SetValue(ref PropertyKey key, ref PropVariant value);
+    void Commit();
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct PropertyKey {
+    public Guid fmtid;
+    public uint pid;
+    public PropertyKey(Guid fmtid, uint pid) { this.fmtid = fmtid; this.pid = pid; }
+  }
+
+  [StructLayout(LayoutKind.Explicit)]
+  struct PropVariant {
+    [FieldOffset(0)] public ushort vt;
+    [FieldOffset(8)] public IntPtr pwsz;
+    public static PropVariant FromString(string value) {
+      return new PropVariant { vt = 31 /* VT_LPWSTR */, pwsz = Marshal.StringToCoTaskMemUni(value) };
+    }
+  }
+
+  [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+  class ShellLink {}
+
+  public static class Aumid {
+    static readonly Guid Fmt = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
+    public static void Set(string lnkPath, string appId) {
+      var link = new ShellLink();
+      var file = (IPersistFile)link;
+      file.Load(lnkPath, 2 /* STGM_READWRITE */);
+      var store = (IPropertyStore)link;
+      var key = new PropertyKey(Fmt, 5);
+      var value = PropVariant.FromString(appId);
+      store.SetValue(ref key, ref value);
+      store.Commit();
+      file.Save(lnkPath, true);
+      Marshal.ReleaseComObject(store);
+      Marshal.ReleaseComObject(file);
+      Marshal.ReleaseComObject(link);
+    }
+  }
+}
+'@
+Add-Type -TypeDefinition $code
+[StellaShortcut.Aumid]::Set($LnkPath, $AppId)
+"#;
+    let ps = format!("{header}{body}");
     let _ = silent_cmd("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .output();
+}
+
+/// Existing installs created their `Stella.lnk` shortcuts before the shortcut
+/// carried an AppUserModelID, so the running desktop window falls back to the
+/// stock Electron taskbar icon. Re-stamp the shortcuts once (gated by a marker
+/// so the PowerShell/Add-Type cost is paid at most once per revision) so the
+/// fix reaches users who update rather than reinstall.
+pub fn refresh_shortcuts_aumid() {
+    #[cfg(target_os = "windows")]
+    {
+        const SHORTCUT_REVISION: &str = "aumid-1";
+        let marker = install_dir().join(".shortcut-revision");
+        if std::fs::read_to_string(&marker)
+            .map(|contents| contents.trim() == SHORTCUT_REVISION)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        let target_exe = installed_exe_path();
+        if !target_exe.exists() {
+            return;
+        }
+        let target = target_exe.to_string_lossy();
+
+        let home = dirs::home_dir().unwrap_or_default();
+        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| {
+            home.join("AppData")
+                .join("Roaming")
+                .to_string_lossy()
+                .to_string()
+        });
+        let start_menu_dir = PathBuf::from(&appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs");
+        let start_menu_lnk = start_menu_dir.join("Stella.lnk");
+        let desktop_lnk = home.join("Desktop").join("Stella.lnk");
+
+        // The Start Menu shortcut is what Windows uses to resolve the taskbar
+        // icon by AppUserModelID, so ensure it exists; only refresh the Desktop
+        // shortcut if the user kept it (don't resurrect a deleted one).
+        let _ = std::fs::create_dir_all(&start_menu_dir);
+        create_win_lnk(&start_menu_lnk, &target);
+        if desktop_lnk.exists() {
+            create_win_lnk(&desktop_lnk, &target);
+        }
+
+        let _ = std::fs::write(&marker, SHORTCUT_REVISION);
+    }
 }
 
 fn register_uninstall(exe_path: &Path, install_dir: &Path) {

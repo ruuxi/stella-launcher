@@ -256,6 +256,10 @@ fn main() {
             app.manage(app_state);
 
             if dev_install_path.is_none() {
+                // Re-stamp shortcuts with the AppUserModelID once, off the
+                // startup path, so existing installs get the correct taskbar
+                // icon after an update instead of only on reinstall.
+                std::thread::spawn(bootstrap::refresh_shortcuts_aumid);
                 schedule_launcher_update_check(app.handle().clone());
             }
 
