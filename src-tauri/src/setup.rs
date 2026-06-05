@@ -2442,6 +2442,30 @@ async fn read_release_manifest(install_dir: &str) -> Result<DesktopReleaseManife
 
 // ── Git init for self-mod ───────────────────────────────────────────
 
+fn install_git_identity(install_dir: &str) -> (String, String) {
+    let mut digest = Sha256::new();
+    digest.update(b"stella-install-git-identity-v1");
+    digest.update(install_dir.as_bytes());
+    for key in ["COMPUTERNAME", "USERDOMAIN", "USERNAME", "HOSTNAME", "USER"] {
+        if let Ok(value) = std::env::var(key) {
+            digest.update(key.as_bytes());
+            digest.update(value.as_bytes());
+        }
+    }
+    let identity = sha256_digest_hex(digest)
+        .chars()
+        .take(12)
+        .collect::<String>();
+    (
+        format!("Stella Install {identity}"),
+        format!("install-{identity}@stella.local"),
+    )
+}
+
+fn git_config_value_missing(output: &std::process::Output) -> bool {
+    !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
 /// Builds a fresh local git repo at the install root with **real upstream
 /// history attached**. The flow is:
 ///
@@ -2474,6 +2498,7 @@ async fn init_git_repo(install_dir: &str) {
         .await
         .ok()
         .and_then(|m| m.commit);
+    let (git_user_name, git_user_email) = install_git_identity(install_dir);
 
     let run_git = |args: Vec<String>| {
         let git_bin = git_bin.clone();
@@ -2490,6 +2515,31 @@ async fn init_git_repo(install_dir: &str) {
 
     let _ = run_git(vec!["--version".into()]).await;
     if path_exists(&git_dir).await {
+        let user_name_missing = run_git(vec!["config".into(), "--get".into(), "user.name".into()])
+            .await
+            .map(|output| git_config_value_missing(&output))
+            .unwrap_or(true);
+        if user_name_missing {
+            let _ = run_git(vec![
+                "config".into(),
+                "user.name".into(),
+                git_user_name.clone(),
+            ])
+            .await;
+        }
+        let user_email_missing =
+            run_git(vec!["config".into(), "--get".into(), "user.email".into()])
+                .await
+                .map(|output| git_config_value_missing(&output))
+                .unwrap_or(true);
+        if user_email_missing {
+            let _ = run_git(vec![
+                "config".into(),
+                "user.email".into(),
+                git_user_email.clone(),
+            ])
+            .await;
+        }
         let head_ok = run_git(vec![
             "rev-parse".into(),
             "--verify".into(),
@@ -2509,6 +2559,31 @@ async fn init_git_repo(install_dir: &str) {
         .await;
     } else {
         let _ = run_git(vec!["init".into()]).await;
+        let user_name_missing = run_git(vec!["config".into(), "--get".into(), "user.name".into()])
+            .await
+            .map(|output| git_config_value_missing(&output))
+            .unwrap_or(true);
+        if user_name_missing {
+            let _ = run_git(vec![
+                "config".into(),
+                "user.name".into(),
+                git_user_name.clone(),
+            ])
+            .await;
+        }
+        let user_email_missing =
+            run_git(vec!["config".into(), "--get".into(), "user.email".into()])
+                .await
+                .map(|output| git_config_value_missing(&output))
+                .unwrap_or(true);
+        if user_email_missing {
+            let _ = run_git(vec![
+                "config".into(),
+                "user.email".into(),
+                git_user_email.clone(),
+            ])
+            .await;
+        }
     }
 
     let remote_ok = run_git(vec![
@@ -2607,10 +2682,6 @@ async fn init_git_repo(install_dir: &str) {
     let mut wrote_baseline_commit = false;
     if let Some(message) = baseline_message {
         let commit_result = run_git(vec![
-            "-c".into(),
-            "user.name=Stella".into(),
-            "-c".into(),
-            "user.email=install@stella.local".into(),
             "commit".into(),
             "--allow-empty".into(),
             "-m".into(),
