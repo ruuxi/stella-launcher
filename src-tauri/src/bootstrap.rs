@@ -192,28 +192,8 @@ fn perform_windows_uninstall(install_root: Option<&Path>) -> Result<(), String> 
 #[cfg(target_os = "windows")]
 fn remove_install_files_sync(root: &Path) -> Result<(), String> {
     // Durable user data lives in `~/.stella` (STELLA_HOME), outside the install
-    // tree. Preserve legacy `<install>/state` during normal uninstall so older
-    // Windows installs with protected state files can still reinstall cleanly.
-    for entry in std::fs::read_dir(root)
-        .map_err(|e| format!("Failed to read Stella install directory: {e}"))?
-    {
-        let entry = entry.map_err(|e| format!("Failed to read Stella install entry: {e}"))?;
-        if entry.file_name() == "state" {
-            continue;
-        }
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("Failed to inspect Stella install entry: {e}"))?;
-        if file_type.is_dir() {
-            std::fs::remove_dir_all(&path)
-                .map_err(|e| format!("Failed to remove Stella directory: {e}"))?;
-        } else {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Failed to remove Stella file: {e}"))?;
-        }
-    }
-    Ok(())
+    // tree, so normal uninstall removes the install root.
+    std::fs::remove_dir_all(root).map_err(|e| format!("Failed to remove Stella directory: {e}"))
 }
 
 pub fn maybe_handle_uninstall() -> bool {
