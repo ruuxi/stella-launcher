@@ -465,7 +465,16 @@ function App() {
 
   /* ── Loading / splash ────────────────────────────────────────── */
 
-  if (!state) {
+  // The `checking` phase is a transient internal probe (disk/version/install
+  // detection) that `check_all` broadcasts via `emit_state_fast` on every
+  // startup. It previously fell into `isWorking` and rendered the *same*
+  // full-screen install-progress UI as an actual install — so on launch the
+  // user briefly saw what looked like an "installing" screen before the real
+  // state (ready/complete) arrived. Render it as the neutral loading splash
+  // instead, so a routine startup check never masquerades as installation.
+  // `failure` still takes priority (handled below) so a desktop crash mid-check
+  // isn't hidden.
+  if (!state || (state.phase === "checking" && !failure)) {
     return (
       <div className="shell">
         <div className="drag-region" />
@@ -489,10 +498,10 @@ function App() {
   }
 
   const isSetup = state.phase === "ready" || state.phase === "error";
+  // `checking` is handled by the loading splash above, so it intentionally no
+  // longer counts as "working" (which renders the install-progress screen).
   const isWorking =
-    state.phase === "installing" ||
-    state.phase === "checking" ||
-    state.phase === "updating";
+    state.phase === "installing" || state.phase === "updating";
   const isComplete = state.phase === "complete";
 
   const canInstall =
