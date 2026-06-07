@@ -316,7 +316,7 @@ fn bun_bin_dir() -> PathBuf {
     home_dir().join(".bun").join("bin")
 }
 fn stella_private_bin_dir() -> PathBuf {
-    stella_home_dir().join("bin")
+    stella_data_dir().join("bin")
 }
 fn ripgrep_private_binary_path() -> PathBuf {
     stella_private_bin_dir().join(ripgrep_executable_name())
@@ -468,8 +468,8 @@ pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
         prepend_path_entry(&bun_bin_dir(), &std::env::var("PATH").unwrap_or_default());
     launch_path = prepend_path_entry(&stella_private_bin_dir(), &launch_path);
     env.insert(
-        "STELLA_HOME".into(),
-        stella_home_dir().to_string_lossy().to_string(),
+        "STELLA_DATA_DIR".into(),
+        stella_data_dir().to_string_lossy().to_string(),
     );
     let git_root = dugite_git_root_of(install_dir);
     if !git_root.exists() {
@@ -792,8 +792,8 @@ async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> Stri
         if let Some(git_exec_path) = launch_env.get("GIT_EXEC_PATH") {
             content.push_str(&format!("set \"GIT_EXEC_PATH={git_exec_path}\"\r\n"));
         }
-        if let Some(stella_home) = launch_env.get("STELLA_HOME") {
-            content.push_str(&format!("set \"STELLA_HOME={stella_home}\"\r\n"));
+        if let Some(stella_data_dir) = launch_env.get("STELLA_DATA_DIR") {
+            content.push_str(&format!("set \"STELLA_DATA_DIR={stella_data_dir}\"\r\n"));
         }
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("set \"PATH={path_value}\"\r\n"));
@@ -823,8 +823,8 @@ async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> Stri
         if let Some(git_template_dir) = launch_env.get("GIT_TEMPLATE_DIR") {
             content.push_str(&format!("export GIT_TEMPLATE_DIR=\"{git_template_dir}\"\n"));
         }
-        if let Some(stella_home) = launch_env.get("STELLA_HOME") {
-            content.push_str(&format!("export STELLA_HOME=\"{stella_home}\"\n"));
+        if let Some(stella_data_dir) = launch_env.get("STELLA_DATA_DIR") {
+            content.push_str(&format!("export STELLA_DATA_DIR=\"{stella_data_dir}\"\n"));
         }
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("export PATH=\"{path_value}\"\n"));
@@ -1968,7 +1968,7 @@ async fn download_and_extract_native_helpers(
 }
 
 async fn remove_install_files(install_path: &str) -> Result<(), String> {
-    // Durable user data lives in `~/.stella` (set as STELLA_HOME on launch),
+    // Durable user data lives in `~/.stella` (set as STELLA_DATA_DIR on launch),
     // outside the install tree, so normal uninstall removes the install root.
     remove_dir_all_tolerating_windows_lock(
         Path::new(install_path),
@@ -3274,7 +3274,7 @@ pub async fn uninstall(state: &mut InstallerState) -> Result<(), String> {
 /// credentials, the skill catalog, the SQLite database — every artifact
 /// that should survive an upgrade. "Erase everything" is intentionally
 /// destructive and must wipe it alongside the install root.
-fn stella_home_dir() -> PathBuf {
+fn stella_data_dir() -> PathBuf {
     home_dir().join(".stella")
 }
 
@@ -3283,7 +3283,7 @@ fn stella_home_dir() -> PathBuf {
 /// home as the literal `.stella` folder. Any drift (test environments
 /// without a real `$HOME`, a manually relocated home, etc.) bails out
 /// instead of risking unrelated user data.
-fn is_erasable_stella_home(path: &Path) -> bool {
+fn is_erasable_stella_data_dir(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
     }
@@ -3321,9 +3321,9 @@ pub async fn full_reset(state: &mut InstallerState) -> Result<(), String> {
             .map_err(|e| format!("Failed to erase Stella folder: {e}"))?;
     }
 
-    let home = stella_home_dir();
+    let home = stella_data_dir();
     if path_exists(&home).await {
-        if !is_erasable_stella_home(&home) {
+        if !is_erasable_stella_data_dir(&home) {
             let msg = "Refusing to erase a folder that does not look like ~/.stella.".to_string();
             state.phase = InstallerPhase::Error;
             state.error_message = Some(msg.clone());
@@ -3400,8 +3400,8 @@ mod tests {
             stella_private_bin_dir().to_string_lossy().as_ref()
         );
         assert_eq!(
-            env.get("STELLA_HOME").map(String::as_str),
-            Some(stella_home_dir().to_string_lossy().as_ref())
+            env.get("STELLA_DATA_DIR").map(String::as_str),
+            Some(stella_data_dir().to_string_lossy().as_ref())
         );
     }
 
@@ -3585,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    fn erasable_stella_home_requires_dot_stella_inside_real_home() {
+    fn erasable_stella_data_dir_requires_dot_stella_inside_real_home() {
         // The literal `~/.stella` is the only path the launcher should ever
         // wipe — anything else (a sibling folder, an arbitrary temp dir,
         // even `~/.stella-archive`) must be refused.
@@ -3594,25 +3594,25 @@ mod tests {
             return;
         }
 
-        assert!(!is_erasable_stella_home(Path::new("/")));
-        assert!(!is_erasable_stella_home(&home));
-        assert!(!is_erasable_stella_home(&home.join(".stella-archive")));
+        assert!(!is_erasable_stella_data_dir(Path::new("/")));
+        assert!(!is_erasable_stella_data_dir(&home));
+        assert!(!is_erasable_stella_data_dir(&home.join(".stella-archive")));
 
         let dir = TestDir::new("erasable-home-wrong-parent");
         let nested = dir.path.join(".stella");
         fs::create_dir_all(&nested).expect("create nested .stella");
         // Right name, wrong parent → refused.
-        assert!(!is_erasable_stella_home(&nested));
+        assert!(!is_erasable_stella_data_dir(&nested));
     }
 
     #[test]
-    fn erasable_stella_home_rejects_missing_or_file_paths() {
+    fn erasable_stella_data_dir_rejects_missing_or_file_paths() {
         let dir = TestDir::new("erasable-home-missing");
-        assert!(!is_erasable_stella_home(&dir.path.join(".stella")));
+        assert!(!is_erasable_stella_data_dir(&dir.path.join(".stella")));
 
         let file_path = dir.path.join(".stella");
         fs::write(&file_path, "not a dir").expect("write sentinel");
-        assert!(!is_erasable_stella_home(&file_path));
+        assert!(!is_erasable_stella_data_dir(&file_path));
     }
 
     #[test]

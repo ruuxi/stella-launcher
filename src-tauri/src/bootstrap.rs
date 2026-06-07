@@ -191,7 +191,7 @@ fn perform_windows_uninstall(install_root: Option<&Path>) -> Result<(), String> 
 
 #[cfg(target_os = "windows")]
 fn remove_install_files_sync(root: &Path) -> Result<(), String> {
-    // Durable user data lives in `~/.stella` (STELLA_HOME), outside the install
+    // Durable user data lives in `~/.stella` (STELLA_DATA_DIR), outside the install
     // tree, so normal uninstall removes the install root.
     std::fs::remove_dir_all(root).map_err(|e| format!("Failed to remove Stella directory: {e}"))
 }
