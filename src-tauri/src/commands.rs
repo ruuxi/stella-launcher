@@ -19,6 +19,8 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const PID_FILE_NAME: &str = ".electron-dev-runner.pid";
+const READY_FILE_NAME: &str = ".electron-dev-runner.ready";
+const DESKTOP_READY_HIDE_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(any(unix, target_os = "windows"))]
 const INSTALL_PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(unix, target_os = "windows"))]
@@ -30,11 +32,29 @@ fn desktop_pid_file(install_path: &str) -> std::path::PathBuf {
     Path::new(install_path).join("desktop").join(PID_FILE_NAME)
 }
 
+fn desktop_ready_file(install_path: &str) -> std::path::PathBuf {
+    Path::new(install_path)
+        .join("desktop")
+        .join(READY_FILE_NAME)
+}
+
 fn read_pid_file(install_path: &str) -> Option<u32> {
     let path = desktop_pid_file(install_path);
     let raw = std::fs::read_to_string(&path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     parsed.get("pid")?.as_u64().map(|p| p as u32)
+}
+
+fn is_desktop_ready(install_path: &str, pid: u32) -> bool {
+    let raw = match std::fs::read_to_string(desktop_ready_file(install_path)) {
+        Ok(raw) => raw,
+        Err(_) => return false,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    parsed.get("pid").and_then(|p| p.as_u64()) == Some(pid as u64)
 }
 
 fn is_desktop_alive(install_path: &str) -> bool {
@@ -410,9 +430,11 @@ fn start_desktop_watcher(
     let app_for_task = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let mut saw_running = false;
+        let mut hid_launcher = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let running = is_desktop_alive(&install_path);
+            let running_pid = read_pid_file(&install_path).filter(|pid| is_pid_alive(*pid));
+            let running = running_pid.is_some();
             if running {
                 if !saw_running {
                     saw_running = true;
@@ -420,6 +442,21 @@ fn start_desktop_watcher(
                         if state.became_alive_at.is_none() {
                             state.became_alive_at = Some(Instant::now());
                         }
+                    }
+                }
+                if !hid_launcher {
+                    let should_hide = running_pid
+                        .map(|pid| is_desktop_ready(&install_path, pid))
+                        .unwrap_or(false)
+                        || lifecycle
+                            .lock()
+                            .ok()
+                            .and_then(|state| state.lifetime())
+                            .map(|uptime| uptime >= DESKTOP_READY_HIDE_TIMEOUT)
+                            .unwrap_or(false);
+                    if should_hide {
+                        hide_main_window(&app_for_task);
+                        hid_launcher = true;
                     }
                 }
                 continue;
@@ -483,8 +520,7 @@ fn start_desktop_exit_waiter(
     let handle = tauri::async_runtime::spawn(async move {
         // `Child::wait` is sync; bounce to a blocking task so we don't
         // park the tokio worker for the duration of the desktop session.
-        let status =
-            tauri::async_runtime::spawn_blocking(move || child.wait()).await;
+        let status = tauri::async_runtime::spawn_blocking(move || child.wait()).await;
         let exit_code: i32 = match status {
             Ok(Ok(s)) => {
                 if let Some(code) = s.code() {
@@ -909,8 +945,7 @@ pub async fn start_install(state: State<'_, AppState>, app: AppHandle) -> Result
             // silently leaving the launcher hidden.
             match spawn_tracked(&info) {
                 Ok((child, log_path)) => {
-                    let lifecycle =
-                        Arc::new(StdMutex::new(LaunchLifecycle::default()));
+                    let lifecycle = Arc::new(StdMutex::new(LaunchLifecycle::default()));
                     start_desktop_watcher(
                         &app,
                         installer.install_path.clone(),
@@ -923,7 +958,6 @@ pub async fn start_install(state: State<'_, AppState>, app: AppHandle) -> Result
                         child,
                         lifecycle,
                     );
-                    hide_main_window(&app);
                 }
                 Err(_) => {
                     // Fall back to the legacy detached spawn if the
@@ -931,14 +965,8 @@ pub async fn start_install(state: State<'_, AppState>, app: AppHandle) -> Result
                     // file). Better to launch without a recovery net
                     // than to fail the post-install hand-off entirely.
                     if spawn_detached(&info) {
-                        let lifecycle =
-                            Arc::new(StdMutex::new(LaunchLifecycle::default()));
-                        start_desktop_watcher(
-                            &app,
-                            installer.install_path.clone(),
-                            lifecycle,
-                        );
-                        hide_main_window(&app);
+                        let lifecycle = Arc::new(StdMutex::new(LaunchLifecycle::default()));
+                        start_desktop_watcher(&app, installer.install_path.clone(), lifecycle);
                     }
                 }
             }
@@ -979,13 +1007,8 @@ pub async fn launch_desktop(
     if let Some(info) = setup::get_launch_info(&installer).await {
         match spawn_tracked(&info) {
             Ok((child, log_path)) => {
-                let lifecycle =
-                    Arc::new(StdMutex::new(LaunchLifecycle::default()));
-                start_desktop_watcher(
-                    &app,
-                    installer.install_path.clone(),
-                    Arc::clone(&lifecycle),
-                );
+                let lifecycle = Arc::new(StdMutex::new(LaunchLifecycle::default()));
+                start_desktop_watcher(&app, installer.install_path.clone(), Arc::clone(&lifecycle));
                 start_desktop_exit_waiter(
                     &app,
                     installer.install_path.clone(),
@@ -993,7 +1016,6 @@ pub async fn launch_desktop(
                     child,
                     lifecycle,
                 );
-                hide_main_window(&app);
                 Ok(OkResult { ok: true })
             }
             Err(err) => {
@@ -1006,9 +1028,7 @@ pub async fn launch_desktop(
                     log_tail: format!("Failed to spawn desktop: {err}"),
                     reached_running: false,
                     log_path: log_path.to_string_lossy().to_string(),
-                    revertable_commit: latest_revertable_commit(
-                        &installer.install_path,
-                    ),
+                    revertable_commit: latest_revertable_commit(&installer.install_path),
                 };
                 if let Ok(mut guard) = state.desktop_failure.lock() {
                     *guard = Some(failure.clone());
@@ -1041,9 +1061,7 @@ pub async fn get_desktop_failure(
 /// the user dismisses the recovery view ("Try again" → relaunch flow
 /// already clears it inside `launch_desktop`).
 #[tauri::command]
-pub async fn clear_desktop_failure(
-    state: State<'_, AppState>,
-) -> Result<OkResult, String> {
+pub async fn clear_desktop_failure(state: State<'_, AppState>) -> Result<OkResult, String> {
     if let Ok(mut guard) = state.desktop_failure.lock() {
         *guard = None;
     }
@@ -1077,9 +1095,7 @@ pub async fn get_revertable_commit(
 }
 
 #[tauri::command]
-pub async fn revert_last_self_mod(
-    state: State<'_, AppState>,
-) -> Result<OkResult, String> {
+pub async fn revert_last_self_mod(state: State<'_, AppState>) -> Result<OkResult, String> {
     let install_path = {
         let installer = state.installer.lock().await;
         installer.install_path.clone()
