@@ -820,6 +820,15 @@ pub struct OkResult {
 #[tauri::command]
 pub async fn get_installer_state(
     state: State<'_, AppState>,
+    _app: AppHandle,
+) -> Result<InstallerState, String> {
+    let installer = state.installer.lock().await;
+    Ok(installer.clone())
+}
+
+#[tauri::command]
+pub async fn refresh_installer_state(
+    state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<InstallerState, String> {
     let mut installer = state.installer.lock().await;

@@ -151,12 +151,31 @@ function App() {
   }, [state?.installPath]);
 
   useEffect(() => {
+    let cancelled = false;
     const unlisten = listen<{ state: InstallerState }>(
       "installer-state-update",
-      (event) => applyState(event.payload.state),
+      (event) => {
+        if (!cancelled) applyState(event.payload.state);
+      },
     );
-    invoke<InstallerState>("get_installer_state").then(applyState);
+    invoke<InstallerState>("get_installer_state")
+      .then((initialState) => {
+        if (cancelled) return;
+        applyState(initialState);
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            if (cancelled) return;
+            void invoke<InstallerState>("refresh_installer_state")
+              .then((refreshedState) => {
+                if (!cancelled) applyState(refreshedState);
+              })
+              .catch(() => {});
+          });
+        });
+      })
+      .catch(() => {});
     return () => {
+      cancelled = true;
       unlisten.then((fn) => fn());
     };
   }, [applyState]);

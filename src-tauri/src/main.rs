@@ -289,6 +289,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_installer_state,
+            commands::refresh_installer_state,
             commands::browse_install_location,
             commands::set_install_location,
             commands::set_run_after_install,
