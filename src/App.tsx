@@ -1133,10 +1133,30 @@ function App() {
                 disabled={!state.canLaunch || desktopRunning || anyDialogBusy}
                 onClick={() => void handleLaunch()}
               >
-                {desktopRunning ? "Launching..." : "Launch Stella"}
+                {desktopRunning ? (
+                  <>
+                    Launching
+                    <span className="dots" aria-hidden="true">
+                      <span>.</span>
+                      <span>.</span>
+                      <span>.</span>
+                    </span>
+                  </>
+                ) : (
+                  "Launch Stella"
+                )}
               </button>
             )}
           </div>
+
+          {isComplete && (
+            <p
+              className={`launch-hint${desktopRunning ? " launch-hint--visible" : ""}`}
+              aria-hidden={!desktopRunning}
+            >
+              This may take a while.
+            </p>
+          )}
 
           {/* Optional, non-forced launcher-update affordance below the
               primary action. Stays visible alongside Launch instead of
