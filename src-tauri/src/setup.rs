@@ -940,6 +940,7 @@ async fn install_payload_dependencies(
         )
         .await;
         ensure_electron_binary_installed(install_dir, state, app).await?;
+        prewarm_vite_dep_cache(install_dir, state, app).await;
         return Ok(());
     }
 
@@ -947,6 +948,7 @@ async fn install_payload_dependencies(
     let result = run_bun_install_with_progress(install_dir, dir, state, app).await;
     if result.ok {
         ensure_electron_binary_installed(install_dir, state, app).await?;
+        prewarm_vite_dep_cache(install_dir, state, app).await;
         // This addon is optional at runtime: the desktop app already falls back to
         // Electron/native-helper permission checks when the native module is missing.
         if let Err(err) = ensure_mac_screen_capture_permissions_built(install_dir).await {
@@ -988,6 +990,40 @@ async fn install_payload_dependencies(
         };
 
         Err(format!("bun install failed: {summary}"))
+    }
+}
+
+/// Pre-warms Vite's dependency-optimizer cache (`node_modules/.vite`) so the
+/// first launch skips the cold prebundle of the heavy renderer deps. Must run
+/// here on the user's machine rather than in release CI: Vite's dep hash
+/// covers the absolute install path, so a CI-baked cache is discarded as
+/// stale. Non-fatal — a failed prewarm just means the first launch pays the
+/// prebundle like before (older payloads without the `deps:prewarm` script
+/// land here too).
+async fn prewarm_vite_dep_cache(install_dir: &str, state: &mut InstallerState, app: &AppHandle) {
+    set_step_progress(
+        state,
+        app,
+        &SetupStepId::Payload,
+        "Optimizing for first launch",
+        Some(0.98),
+    );
+    log_install(install_dir, "Pre-warming Vite dependency cache").await;
+
+    let result = run(
+        &["bun", "run", "deps:prewarm"],
+        Some(Path::new(install_dir)),
+    )
+    .await;
+    if result.ok {
+        log_install(install_dir, "Vite dependency cache ready").await;
+    } else {
+        let summary = run_failure_summary(&result, "Vite dependency prewarm failed.");
+        log_install(
+            install_dir,
+            &format!("bun run deps:prewarm failed (continuing)\n{summary}"),
+        )
+        .await;
     }
 }
 
