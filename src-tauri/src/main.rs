@@ -214,7 +214,7 @@ fn main() {
         // one WebView2 user-data dir for this identifier, which surfaces as
         // a blank white window + duplicate tray icons.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            commands::show_main_window(app);
+            commands::reopen_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -276,7 +276,7 @@ fn main() {
             tray_builder
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "open" => {
-                        commands::show_main_window(app);
+                        commands::reopen_main_window(app);
                     }
                     "quit" => {
                         app.exit(0);

@@ -773,12 +773,12 @@ pub fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
 
-        // WebView2 suspends its rendering pipeline while the window is
-        // hidden and frequently comes back blank after `show()` on Windows
-        // (WebView2Feedback #2983 / #4763). A 1px size nudge forces a
-        // relayout + repaint so the launcher UI actually paints instead of
-        // showing an empty white window.
-        #[cfg(target_os = "windows")]
+        // Both WebView2 (Windows) and WKWebView (macOS) suspend their
+        // rendering pipeline while the window is hidden and frequently come
+        // back blank after `show()` (WebView2Feedback #2983 / #4763). A 1px
+        // size nudge forces a relayout + repaint so the launcher UI actually
+        // paints instead of showing an empty white window.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if let Ok(size) = window.outer_size() {
             let nudged = tauri::PhysicalSize::new(size.width.saturating_add(1), size.height);
             let _ = window.set_size(nudged);
@@ -796,6 +796,27 @@ pub fn show_main_window(app: &AppHandle) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
+    }
+}
+
+/// Re-surface the launcher in response to an *explicit* user "open" action:
+/// the tray "Open Stella" item, or re-launching the app shortcut while an
+/// instance is already resident (single-instance plugin).
+///
+/// Beyond the normal show path, this force-reloads the webview. The launcher
+/// stays alive in the tray (macOS Accessory / Windows tray) while the desktop
+/// runs, so its webview can sit hidden long enough that WKWebView/WebView2
+/// drop the rendered page and repaint blank on `show()`. The single-instance
+/// plugin routes the user's relaunch back to that same stuck process, so
+/// without a reload the window just re-appears still-blank -- which is why
+/// users had to fully quit the launcher (let the process die) before a fresh
+/// open would paint. A reload re-runs the renderer in place and recovers it
+/// without killing the process. Launcher UI state is derived from the Rust
+/// side (re-fetched on mount), so the reload loses nothing meaningful.
+pub fn reopen_main_window(app: &AppHandle) {
+    show_main_window(app);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.reload();
     }
 }
 
