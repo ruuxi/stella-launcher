@@ -50,7 +50,6 @@ pub enum SetupStepId {
     Runtime,
     Parakeet,
     Payload,
-    NativeHelpers,
     Deps,
     Env,
     Browser,
@@ -88,7 +87,6 @@ pub enum InstallerPhase {
     Checking,
     Ready,
     Installing,
-    Updating,
     Complete,
     Error,
 }

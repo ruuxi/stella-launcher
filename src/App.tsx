@@ -519,8 +519,7 @@ function App() {
   const isSetup = state.phase === "ready" || state.phase === "error";
   // `checking` is handled by the loading splash above, so it intentionally no
   // longer counts as "working" (which renders the install-progress screen).
-  const isWorking =
-    state.phase === "installing" || state.phase === "updating";
+  const isWorking = state.phase === "installing";
   const isComplete = state.phase === "complete";
 
   const canInstall =
@@ -1139,9 +1138,7 @@ function App() {
               <button type="button" className="btn-primary" disabled>
                 {state.phase === "checking"
                   ? "Checking..."
-                  : state.phase === "updating"
-                    ? "Updating..."
-                    : `Installing · ${progress}%`}
+                  : `Installing · ${progress}%`}
               </button>
             )}
 

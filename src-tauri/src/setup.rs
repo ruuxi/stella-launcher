@@ -33,10 +33,6 @@ const GITHUB_REPO: &str = "ruuxi/stella";
 const STELLA_GITHUB_REMOTE_URL: &str = "https://github.com/ruuxi/stella";
 const DEFAULT_DESKTOP_RELEASE_MANIFEST_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/desktop/current.json";
-const DEFAULT_NATIVE_HELPERS_MANIFEST_URL: &str =
-    "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/native-helpers/current.json";
-const DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL: &str =
-    "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/native-helpers";
 const INSTALL_DIR_NAME: &str = "stella";
 const DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -621,28 +617,6 @@ struct DesktopDownloadAsset {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct NativeHelpersManifest {
-    schema_version: u32,
-    #[serde(default)]
-    sha: Option<String>,
-    #[serde(default)]
-    commit: Option<String>,
-    #[serde(default)]
-    built_at: Option<String>,
-    assets: HashMap<String, NativeHelpersAsset>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NativeHelpersAsset {
-    url: String,
-    sha256: String,
-    #[allow(dead_code)]
-    size: u64,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DesktopReleaseManifest {
     schema_version: u32,
     tag: String,
@@ -667,49 +641,6 @@ fn desktop_release_manifest_url() -> String {
         .unwrap_or_else(|| DEFAULT_DESKTOP_RELEASE_MANIFEST_URL.to_string())
 }
 
-fn native_helpers_manifest_url() -> String {
-    std::env::var("STELLA_NATIVE_HELPERS_MANIFEST_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_NATIVE_HELPERS_MANIFEST_URL.to_string())
-}
-
-fn native_helpers_base_url() -> String {
-    std::env::var("STELLA_NATIVE_HELPERS_BASE_URL")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL.to_string())
-}
-
-async fn native_helpers_manifest_urls_for_install(install_dir: &str) -> Vec<String> {
-    if std::env::var("STELLA_NATIVE_HELPERS_MANIFEST_URL")
-        .ok()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return vec![native_helpers_manifest_url()];
-    }
-
-    let mut urls = Vec::new();
-    if let Ok(release) = read_release_manifest(install_dir).await {
-        if release.tag.starts_with("desktop-v") {
-            urls.push(format!(
-                "{}/{}/manifest.json",
-                native_helpers_base_url(),
-                release.tag
-            ));
-        }
-    }
-
-    let current_url = native_helpers_manifest_url();
-    if !urls.iter().any(|url| url == &current_url) {
-        urls.push(current_url);
-    }
-    urls
-}
-
 fn desktop_platform_key() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         "win-x64"
@@ -722,18 +653,11 @@ fn desktop_platform_key() -> &'static str {
     }
 }
 
-fn native_helpers_platform_key() -> &'static str {
-    desktop_platform_key()
-}
-
 fn native_helpers_dir_of(install_dir: &str) -> PathBuf {
     desktop_dir_of(install_dir)
         .join("native")
         .join("out")
         .join(native_helpers_platform_dir())
-}
-fn native_helpers_install_manifest_of(install_dir: &str) -> PathBuf {
-    native_helpers_dir_of(install_dir).join(".stella-native-helpers.json")
 }
 
 fn normalize_sha256(value: &str) -> Option<String> {
@@ -1772,201 +1696,6 @@ async fn download_and_extract_release(
     Ok(())
 }
 
-async fn download_and_extract_native_helpers(
-    install_dir: &str,
-    state: &mut InstallerState,
-    app: &AppHandle,
-) -> Result<(), String> {
-    let platform = native_helpers_platform_key();
-    let manifest_urls = native_helpers_manifest_urls_for_install(install_dir).await;
-    set_step_progress(
-        state,
-        app,
-        &SetupStepId::NativeHelpers,
-        "Looking up native helpers",
-        Some(0.05),
-    );
-
-    let client = download_client()?;
-    let mut manifest_source: Option<(String, String)> = None;
-    let mut manifest_errors = Vec::new();
-    for manifest_url in manifest_urls {
-        log_install(
-            install_dir,
-            &format!("Resolving native helpers manifest: {manifest_url}"),
-        )
-        .await;
-        match fetch_required_text(&client, &manifest_url).await {
-            Ok(manifest_text) => {
-                manifest_source = Some((manifest_url, manifest_text));
-                break;
-            }
-            Err(err) => {
-                log_install(
-                    install_dir,
-                    &format!("Native helpers manifest unavailable: {err}"),
-                )
-                .await;
-                manifest_errors.push(err);
-            }
-        }
-    }
-    let (manifest_url, manifest_text) = manifest_source.ok_or_else(|| {
-        manifest_errors
-            .pop()
-            .unwrap_or_else(|| "Native helpers manifest was unavailable.".to_string())
-    })?;
-    let manifest: NativeHelpersManifest = serde_json::from_str(&manifest_text)
-        .map_err(|e| format!("Native helpers manifest was invalid JSON: {e}"))?;
-    if manifest.schema_version != 1 {
-        return Err("Native helpers manifest schema is not supported.".into());
-    }
-
-    let asset = manifest.assets.get(platform).cloned().ok_or_else(|| {
-        format!("Native helpers manifest did not include an asset for {platform}.")
-    })?;
-
-    log_install(
-        install_dir,
-        &format!(
-            "Downloading native helpers ({}{}) from {}",
-            manifest.sha.as_deref().unwrap_or("unknown"),
-            manifest
-                .commit
-                .as_deref()
-                .map(|c| format!(" / {c}"))
-                .unwrap_or_default(),
-            asset.url,
-        ),
-    )
-    .await;
-    set_step_progress(
-        state,
-        app,
-        &SetupStepId::NativeHelpers,
-        "Downloading native helpers",
-        Some(0.15),
-    );
-
-    let archive_path = Path::new(install_dir).join(".stella-native-helpers-download.tar.zst");
-    download_archive_with_resume(
-        &client,
-        &asset.url,
-        &archive_path,
-        Some(asset.size),
-        Some(&asset.sha256),
-        install_dir,
-        state,
-        app,
-        SetupStepId::NativeHelpers,
-        "native helpers",
-        0.15,
-        0.55,
-    )
-    .await?;
-
-    set_step_progress(
-        state,
-        app,
-        &SetupStepId::NativeHelpers,
-        "Extracting native helpers",
-        Some(0.78),
-    );
-
-    let helpers_dir = native_helpers_dir_of(install_dir);
-    let install_manifest_path = native_helpers_install_manifest_of(install_dir);
-    let helpers_dir_str = helpers_dir.to_string_lossy().to_string();
-    let archive_path_for_extract = archive_path.clone();
-    let extract_result = tokio::task::spawn_blocking(move || {
-        let archive_file = std::fs::File::open(&archive_path_for_extract)
-            .map_err(|e| format!("open native helpers archive failed: {e}"))?;
-        let decoder = zstd::Decoder::new(archive_file)
-            .map_err(|e| format!("native helpers zstd decompress failed: {e}"))?;
-        let mut archive = tar::Archive::new(decoder);
-
-        std::fs::create_dir_all(&helpers_dir_str)
-            .map_err(|e| format!("mkdir native helpers dir failed: {e}"))?;
-        // Wipe stale binaries — old contents may shadow renamed/removed helpers.
-        if let Ok(entries) = std::fs::read_dir(&helpers_dir_str) {
-            for entry in entries.flatten() {
-                let _ = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    std::fs::remove_dir_all(entry.path())
-                } else {
-                    std::fs::remove_file(entry.path())
-                };
-            }
-        }
-
-        archive
-            .unpack(&helpers_dir_str)
-            .map_err(|e| format!("native helpers tar extract failed: {e}"))?;
-
-        // Belt-and-suspenders: ensure exec bits on Unix. tar should preserve
-        // them, but Rust's tar crate has historically lost them across some zstd
-        // pipelines; explicitly walking the dir is cheap and idempotent.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fn chmod_recursive(path: &std::path::Path) -> std::io::Result<()> {
-                if path.is_dir() {
-                    for entry in std::fs::read_dir(path)? {
-                        let entry = entry?;
-                        chmod_recursive(&entry.path())?;
-                    }
-                } else if path.is_file() {
-                    let mut perms = std::fs::metadata(path)?.permissions();
-                    perms.set_mode(0o755);
-                    std::fs::set_permissions(path, perms)?;
-                }
-                Ok(())
-            }
-            let _ = chmod_recursive(std::path::Path::new(&helpers_dir_str));
-        }
-
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("Native helpers extract task failed: {e}"))
-    .and_then(|result| result);
-    let _ = fs::remove_file(&archive_path).await;
-    extract_result?;
-
-    let install_manifest = serde_json::json!({
-        "schemaVersion": 1,
-        "sourceManifestUrl": manifest_url,
-        "platform": platform,
-        "helperPlatformDir": native_helpers_platform_dir(),
-        "sha": manifest.sha,
-        "commit": manifest.commit,
-        "builtAt": manifest.built_at,
-        "installedAt": chrono_now(),
-        "asset": {
-            "url": asset.url,
-            "sha256": asset.sha256,
-            "size": asset.size,
-        },
-    });
-    fs::write(
-        &install_manifest_path,
-        format!(
-            "{}\n",
-            serde_json::to_string_pretty(&install_manifest).unwrap_or_default()
-        ),
-    )
-    .await
-    .map_err(|e| format!("Failed to write native helpers install manifest: {e}"))?;
-
-    log_install(install_dir, "Native helpers extracted").await;
-    set_step_progress(
-        state,
-        app,
-        &SetupStepId::NativeHelpers,
-        "Native helpers ready",
-        Some(0.95),
-    );
-    Ok(())
-}
-
 async fn remove_install_files(install_path: &str) -> Result<(), String> {
     // Durable user data lives in `~/.stella` (set as STELLA_DATA_DIR on launch),
     // outside the install tree, so normal uninstall removes the install root.
@@ -2755,7 +2484,6 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
             }
         }
         SetupStepId::Payload => payload_step_check(dir).await,
-        SetupStepId::NativeHelpers => StepCheck::complete(),
         SetupStepId::Parakeet => parakeet_step_check(dir).await,
         SetupStepId::Finalize => {
             if state.dev_mode || valid_install_manifest_exists(dir).await {
@@ -2782,36 +2510,6 @@ async fn payload_step_check(dir: &str) -> StepCheck {
     if !looks_like_stella_source_tree(Path::new(dir)) {
         return StepCheck::incomplete("The selected folder is not a Stella desktop install.");
     }
-    StepCheck::complete()
-}
-
-async fn native_helpers_step_check(dir: &str) -> StepCheck {
-    let helpers_dir = native_helpers_dir_of(dir);
-    if !path_exists(&helpers_dir).await {
-        return StepCheck::incomplete_silent();
-    }
-    // Sentinel: pick a binary that ships on every supported platform.
-    let sentinel = if cfg!(target_os = "windows") {
-        helpers_dir.join("window_info.exe")
-    } else {
-        helpers_dir.join("window_info")
-    };
-    if !path_exists(&sentinel).await {
-        return StepCheck::incomplete_silent();
-    }
-
-    let install_manifest_path = native_helpers_install_manifest_of(dir);
-    let Ok(raw) = fs::read_to_string(&install_manifest_path).await else {
-        // Legacy installs did not write helper metadata. Keep them launchable;
-        // desktop update/repair paths can refresh and add the manifest.
-        return StepCheck::complete();
-    };
-    let Ok(_parsed) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return StepCheck::incomplete("Native helper install record is invalid.");
-    };
-    // Native helper releases are compatibility payloads and may intentionally
-    // lag the desktop release. The launcher only needs the helper shape to be
-    // present and its install record to be readable.
     StepCheck::complete()
 }
 
@@ -2888,7 +2586,6 @@ async fn install_step(
             install_payload_dependencies(&dir, state, app).await?;
             Ok(())
         }
-        SetupStepId::NativeHelpers => download_and_extract_native_helpers(&dir, state, app).await,
         SetupStepId::Parakeet => {
             if let Err(err) = ensure_parakeet_model_downloaded(&dir).await {
                 // Log for debugging, but don't pop a banner — local dictation
@@ -3236,8 +2933,6 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
             exe.to_string_lossy().to_string(),
         );
     }
-    env.insert("STELLA_LAUNCHER_MANAGED_RUNTIME".into(), "1".into());
-
     Some(LaunchInfo {
         command: desktop_launch_command(state.low_resource_mode),
         cwd: dir.clone(),
@@ -3432,19 +3127,6 @@ mod tests {
             helpers_dir.join("window_info")
         };
         fs::write(sentinel, "").expect("write native helper sentinel");
-    }
-
-    fn write_native_helpers_install_manifest(path: &Path, sha: &str) {
-        let install_dir = path.to_string_lossy();
-        let manifest_path = native_helpers_install_manifest_of(&install_dir);
-        fs::write(
-            manifest_path,
-            format!(
-                r#"{{"schemaVersion":1,"sha":"{sha}","platform":"{}"}}"#,
-                native_helpers_platform_key()
-            ),
-        )
-        .expect("write native helpers install manifest");
     }
 
     fn write_generic_package_shape(path: &Path) {
@@ -3691,42 +3373,6 @@ mod tests {
             tauri::async_runtime::block_on(payload_step_complete(&dir.path.to_string_lossy()));
 
         assert!(complete);
-    }
-
-    #[test]
-    fn native_helpers_completion_accepts_lagging_helper_release() {
-        let dir = TestDir::new("lagging-native-helpers");
-        write_install_shape(&dir.path);
-        write_release_manifest_with_tag(&dir.path, "desktop-v0.0.253", &["desktop/package.json"]);
-        write_native_helpers_shape(&dir.path);
-        write_native_helpers_install_manifest(&dir.path, "desktop-v0.0.248");
-
-        let check =
-            tauri::async_runtime::block_on(native_helpers_step_check(&dir.path.to_string_lossy()));
-
-        assert!(check.complete);
-        assert_eq!(check.reason, None);
-    }
-
-    #[test]
-    fn native_helpers_manifest_urls_fall_back_to_current_manifest() {
-        let dir = TestDir::new("native-helper-manifest-fallback");
-        write_release_manifest_with_tag(&dir.path, "desktop-v0.0.253", &[]);
-
-        let urls = tauri::async_runtime::block_on(native_helpers_manifest_urls_for_install(
-            &dir.path.to_string_lossy(),
-        ));
-
-        assert_eq!(
-            urls,
-            vec![
-                format!(
-                    "{}/desktop-v0.0.253/manifest.json",
-                    DEFAULT_NATIVE_HELPERS_PUBLIC_BASE_URL
-                ),
-                DEFAULT_NATIVE_HELPERS_MANIFEST_URL.to_string(),
-            ]
-        );
     }
 
     #[test]

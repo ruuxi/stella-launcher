@@ -3,7 +3,6 @@ export type SetupStepId =
   | "prepare"
   | "parakeet"
   | "payload"
-  | "nativehelpers"
   | "deps"
   | "env"
   | "browser"
@@ -30,7 +29,6 @@ export type InstallerPhase =
   | "checking"
   | "ready"
   | "installing"
-  | "updating"
   | "complete"
   | "error";
 
