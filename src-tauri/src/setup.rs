@@ -2647,38 +2647,18 @@ fn git_config_value_missing(output: &std::process::Output) -> bool {
     !output.status.success() || String::from_utf8_lossy(&output.stdout).trim().is_empty()
 }
 
-/// Builds a fresh local git repo at the install root with **real upstream
-/// history attached**. The flow is:
-///
-/// 1. `git init` + add `origin` pointing at the public Stella repo.
-/// 2. `git fetch origin <installCommit>` — pulls the release commit into the
-///    local repo using normal Git object storage.
-/// 3. `git reset --mixed <installCommit>` — moves HEAD to the real upstream
-///    SHA the tarball was built from. The working tree (already on disk
-///    from the tarball) matches that commit byte-for-byte because the
-///    release workflow now uses `git archive HEAD` to produce it, modulo
-///    ignored launcher-local files like `stella-release.json`.
-/// 4. If there is tracked tarball-vs-commit drift, create a local baseline
-///    commit. The normal clean path leaves HEAD directly on the upstream
-///    release commit.
-///
-/// The result is a local repo with full upstream history where self-mod
-/// commits accrue on top of a real upstream SHA — so the install-update
-/// agent can `git fetch origin <newer>` + `git merge` and let git do the
-/// three-way merge work properly.
-async fn init_git_repo(install_dir: &str) {
+/// Configure a private identity for self-mod commits in the cloned repository.
+/// Fresh installs must already contain a valid clone; this never synthesizes
+/// or repairs repository history.
+async fn configure_cloned_git_identity(install_dir: &str) {
     let git_dir = Path::new(install_dir).join(".git");
     let git_bin = dugite_git_bin_of(install_dir);
-    if !path_exists(&git_bin).await {
+    if !path_exists(&git_dir).await || !path_exists(&git_bin).await {
         return;
     }
 
     let env = dugite_launch_env(install_dir);
     let cwd = PathBuf::from(install_dir);
-    let install_commit = read_release_manifest(install_dir)
-        .await
-        .ok()
-        .and_then(|m| m.commit);
     let (git_user_name, git_user_email) = install_git_identity(install_dir);
 
     let run_git = |args: Vec<String>| {
@@ -2694,216 +2674,25 @@ async fn init_git_repo(install_dir: &str) {
         }
     };
 
-    let _ = run_git(vec!["--version".into()]).await;
-    if path_exists(&git_dir).await {
-        let user_name_missing = run_git(vec!["config".into(), "--get".into(), "user.name".into()])
-            .await
-            .map(|output| git_config_value_missing(&output))
-            .unwrap_or(true);
-        if user_name_missing {
-            let _ = run_git(vec![
-                "config".into(),
-                "user.name".into(),
-                git_user_name.clone(),
-            ])
-            .await;
-        }
-        let user_email_missing =
-            run_git(vec!["config".into(), "--get".into(), "user.email".into()])
-                .await
-                .map(|output| git_config_value_missing(&output))
-                .unwrap_or(true);
-        if user_email_missing {
-            let _ = run_git(vec![
-                "config".into(),
-                "user.email".into(),
-                git_user_email.clone(),
-            ])
-            .await;
-        }
-        let head_ok = run_git(vec![
-            "rev-parse".into(),
-            "--verify".into(),
-            "HEAD^{commit}".into(),
-        ])
+    let user_name_missing = run_git(vec!["config".into(), "--get".into(), "user.name".into()])
         .await
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-        if head_ok {
-            return; // Already has a usable git repo.
-        }
-        let _ = fs::remove_file(git_dir.join("index.lock")).await;
-        log_install(
-            install_dir,
-            "Repairing incomplete git repository before launch.",
-        )
-        .await;
-    } else {
-        let _ = run_git(vec!["init".into()]).await;
-        let user_name_missing = run_git(vec!["config".into(), "--get".into(), "user.name".into()])
-            .await
-            .map(|output| git_config_value_missing(&output))
-            .unwrap_or(true);
-        if user_name_missing {
-            let _ = run_git(vec![
-                "config".into(),
-                "user.name".into(),
-                git_user_name.clone(),
-            ])
-            .await;
-        }
-        let user_email_missing =
-            run_git(vec!["config".into(), "--get".into(), "user.email".into()])
-                .await
-                .map(|output| git_config_value_missing(&output))
-                .unwrap_or(true);
-        if user_email_missing {
-            let _ = run_git(vec![
-                "config".into(),
-                "user.email".into(),
-                git_user_email.clone(),
-            ])
-            .await;
-        }
-    }
-
-    let remote_ok = run_git(vec![
-        "config".into(),
-        "--get".into(),
-        "remote.origin.url".into(),
-    ])
-    .await
-    .map(|output| output.status.success())
-    .unwrap_or(false);
-    if remote_ok {
-        let _ = run_git(vec![
-            "remote".into(),
-            "set-url".into(),
-            "origin".into(),
-            STELLA_GITHUB_REMOTE_URL.into(),
-        ])
-        .await;
-    } else {
-        let _ = run_git(vec![
-            "remote".into(),
-            "add".into(),
-            "origin".into(),
-            STELLA_GITHUB_REMOTE_URL.into(),
-        ])
-        .await;
-    }
-
-    let mut baseline_message: Option<&str> = None;
-    let fetched_release_history = match &install_commit {
-        Some(commit) if !commit.is_empty() => {
-            let fetch_result = run_git(vec![
-                "fetch".into(),
-                "--no-tags".into(),
-                "origin".into(),
-                commit.clone(),
-            ])
-            .await;
-
-            let fetched_ok = fetch_result
-                .as_ref()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-
-            if fetched_ok {
-                let current_branch =
-                    run_git(vec!["symbolic-ref".into(), "--short".into(), "HEAD".into()])
-                        .await
-                        .ok()
-                        .filter(|output| output.status.success())
-                        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                        .filter(|branch| !branch.is_empty())
-                        .unwrap_or_else(|| "master".to_string());
-                let _ = run_git(vec![
-                    "update-ref".into(),
-                    format!("refs/heads/{current_branch}"),
-                    commit.clone(),
-                ])
-                .await;
-                // Move HEAD to the real upstream SHA without touching the
-                // working tree (which already has the upstream files from
-                // the tarball). `--mixed` updates the index, so any drift
-                // (e.g., the synthetic stella-release.json) shows as
-                // staged changes for the baseline commit below.
-                let _ = run_git(vec![
-                    "reset".into(),
-                    "--mixed".into(),
-                    "--no-refresh".into(),
-                    commit.clone(),
-                ])
-                .await;
-                true
-            } else {
-                // Network problem at install time: fall back to a
-                // synthetic-root repo. The install-update agent will
-                // self-heal by fetching at update time.
-                baseline_message = Some("start");
-                false
-            }
-        }
-        _ => {
-            baseline_message = Some("start");
-            false
-        }
-    };
-
-    let _ = run_git(vec!["add".into(), "-A".into()]).await;
-    let has_staged_changes = run_git(vec!["diff".into(), "--cached".into(), "--quiet".into()])
-        .await
-        .map(|output| !output.status.success())
+        .map(|output| git_config_value_missing(&output))
         .unwrap_or(true);
-    if fetched_release_history && has_staged_changes {
-        baseline_message = Some("Stella install baseline");
+    if user_name_missing {
+        let _ = run_git(vec!["config".into(), "user.name".into(), git_user_name]).await;
     }
-
-    let mut wrote_baseline_commit = false;
-    if let Some(message) = baseline_message {
-        let commit_result = run_git(vec![
-            "commit".into(),
-            "--allow-empty".into(),
-            "-m".into(),
-            message.into(),
-        ])
-        .await;
-        wrote_baseline_commit = commit_result
-            .as_ref()
-            .map(|output| output.status.success())
-            .unwrap_or(false);
-    }
-
-    // Capture the local baseline commit SHA so the install-update agent
-    // has a stable boundary marker between user-local commits and
-    // upstream history (everything reachable from HEAD~1 is upstream).
-    if wrote_baseline_commit {
-        if let Ok(output) = run_git(vec!["rev-parse".into(), "HEAD".into()]).await {
-            if output.status.success() {
-                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !sha.is_empty() {
-                    let _ = update_manifest_install_base_commit(install_dir, &sha).await;
-                }
-            }
-        }
-    }
-}
-
-async fn update_manifest_install_base_commit(install_dir: &str, sha: &str) -> Result<(), String> {
-    let manifest_path = manifest_of(install_dir);
-    let raw = fs::read_to_string(&manifest_path)
+    let user_email_missing = run_git(vec!["config".into(), "--get".into(), "user.email".into()])
         .await
-        .map_err(|e| format!("Failed to read install manifest: {e}"))?;
-    let mut manifest: Manifest = serde_json::from_str(&raw)
-        .map_err(|e| format!("Install manifest was invalid JSON: {e}"))?;
-    manifest.desktop_install_base_commit = Some(sha.to_string());
-    write_install_manifest_atomic(&manifest_path, &manifest).await
+        .map(|output| git_config_value_missing(&output))
+        .unwrap_or(true);
+    if user_email_missing {
+        let _ = run_git(vec!["config".into(), "user.email".into(), git_user_email]).await;
+    }
 }
 
-fn schedule_git_repo_init(install_dir: String) {
+fn schedule_cloned_git_identity(install_dir: String) {
     tokio::spawn(async move {
-        init_git_repo(&install_dir).await;
+        configure_cloned_git_identity(&install_dir).await;
     });
 }
 
@@ -3143,11 +2932,9 @@ async fn install_step(
                 desktop_release_tag: release_manifest
                     .as_ref()
                     .map(|manifest| manifest.tag.clone()),
-                desktop_archive_sha256: None,
                 desktop_release_commit: release_manifest
                     .as_ref()
                     .and_then(|manifest| manifest.commit.clone()),
-                desktop_install_base_commit: None,
                 platform: std::env::consts::OS.into(),
                 installed_at: chrono_now(),
                 install_path: dir.clone(),
@@ -3157,10 +2944,7 @@ async fn install_step(
 
             write_install_manifest_atomic(&manifest_of(&dir), &manifest).await?;
 
-            // Fresh installs are already exact upstream clones. This remains a
-            // cheap background repair/identity pass for older or interrupted
-            // installations.
-            schedule_git_repo_init(dir.clone());
+            schedule_cloned_git_identity(dir.clone());
 
             write_registry(&manifest).await;
             Ok(())
@@ -3458,7 +3242,7 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
     }
 
     prune_legacy_split_dirs(dir).await;
-    schedule_git_repo_init(dir.clone());
+    schedule_cloned_git_identity(dir.clone());
     if !ripgrep_private_binary_exists().await {
         let _ = ensure_ripgrep_provisioned(dir).await;
     }
@@ -3898,6 +3682,17 @@ mod tests {
         assert!(portable_git_archive_path()
             .expect("portable Git archive path")
             .ends_with(asset.file_name));
+    }
+
+    #[test]
+    fn identity_setup_never_synthesizes_missing_git_history() {
+        let dir = TestDir::new("missing-clone-history");
+
+        tauri::async_runtime::block_on(configure_cloned_git_identity(
+            &dir.path.to_string_lossy(),
+        ));
+
+        assert!(!dir.path.join(".git").exists());
     }
 
     #[test]
