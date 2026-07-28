@@ -3957,6 +3957,7 @@ name = "stella-launcher"
 version = "0.0.133"
 dependencies = [
  "dirs",
+ "flate2",
  "fs2",
  "futures-util",
  "keyring",

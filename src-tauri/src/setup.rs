@@ -1,6 +1,7 @@
 use crate::disk;
 use crate::shell::run;
 use crate::state::*;
+use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, CONTENT_RANGE, RANGE};
 use sha2::{Digest, Sha256};
@@ -21,15 +22,15 @@ const RELEASE_MANIFEST: &str = "stella-release.json";
 const LAUNCH_SCRIPT_WIN: &str = "launch.cmd";
 const LAUNCH_SCRIPT_UNIX: &str = "launch.sh";
 const ENV_FILE_NAME: &str = ".env.local";
-// Hydrated desktop payloads are roughly 3.7 GiB while the downloaded archive
-// and extracted app coexist. Keep headroom for filesystem metadata and caches.
+// A cold clone install temporarily holds the checked-out app, Bun's package
+// cache, node_modules, Electron, and release-pinned native artifacts together.
+// Keep headroom for filesystem metadata and installer caches.
 const ESTIMATED_INSTALL_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GB
 const DEFAULT_ENV_FILE_CONTENTS: &str = "\
 VITE_CONVEX_URL=https://benevolent-minnow-586.convex.cloud\n\
 VITE_CONVEX_SITE_URL=https://cloud.stella.sh\n\
 VITE_SITE_URL=https://stella.sh\n";
 
-const GITHUB_REPO: &str = "ruuxi/stella";
 const STELLA_GITHUB_REMOTE_URL: &str = "https://github.com/ruuxi/stella";
 const DEFAULT_DESKTOP_RELEASE_MANIFEST_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/desktop/current.json";
@@ -40,18 +41,7 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOWS_REMOVE_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const WINDOWS_REMOVE_RETRY_POLL: Duration = Duration::from_millis(250);
 const RIPGREP_VERSION: &str = "15.1.0";
-
-fn release_tarball_name() -> &'static str {
-    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        "stella-desktop-win-x64.tar.zst"
-    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        "stella-desktop-darwin-arm64.tar.zst"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "stella-desktop-darwin-x64.tar.zst"
-    } else {
-        "stella-desktop-linux-x64.tar.zst"
-    }
-}
+const DUGITE_VERSION: &str = "3.2.2";
 
 fn native_helpers_platform_dir() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -89,63 +79,6 @@ fn ripgrep_executable_name() -> &'static str {
     } else {
         "rg"
     }
-}
-
-fn release_download_url(tag: &str) -> String {
-    format!(
-        "https://github.com/{GITHUB_REPO}/releases/download/{tag}/{}",
-        release_tarball_name()
-    )
-}
-
-/// Stable URL that always resolves to whatever GitHub marks as the latest non-prerelease release.
-fn release_latest_download_url() -> String {
-    format!(
-        "https://github.com/{GITHUB_REPO}/releases/latest/download/{}",
-        release_tarball_name()
-    )
-}
-
-/// Get the newest `desktop-v*` release tag from GitHub (fallback when `releases/latest` is not a desktop release).
-async fn latest_release_tag() -> Option<String> {
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=100");
-    let client = download_client().ok()?;
-    let resp = client
-        .get(&url)
-        .header("User-Agent", "stella-launcher")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let releases: Vec<serde_json::Value> = resp.json().await.ok()?;
-
-    // Find the first release whose tag starts with "desktop-v"
-    for release in &releases {
-        if let Some(tag) = release["tag_name"].as_str() {
-            if tag.starts_with("desktop-v") {
-                return Some(tag.to_string());
-            }
-        }
-    }
-
-    // Fallback: any release with the right asset name
-    let asset_name = release_tarball_name();
-    for release in &releases {
-        if let Some(assets) = release["assets"].as_array() {
-            for asset in assets {
-                if asset["name"].as_str() == Some(asset_name) {
-                    return release["tag_name"].as_str().map(|s| s.to_string());
-                }
-            }
-        }
-    }
-
-    None
 }
 
 // ── Path helpers ────────────────────────────────────────────────────
@@ -268,8 +201,13 @@ fn is_partial_launcher_install_dir(path: &Path) -> bool {
             && (name == "stella-install.log"
                 || name == ".DS_Store"
                 || name == ".stella-desktop-download.tar.zst"
-                || name == ".stella-native-helpers-download.tar.zst")
+                || name == ".stella-native-helpers-download.tar.zst"
+                || name == ".stella-browser-download")
         {
+            saw_launcher_artifact = true;
+            continue;
+        }
+        if file_type.is_dir() && name == ".stella-source-clone" {
             saw_launcher_artifact = true;
             continue;
         }
@@ -422,12 +360,15 @@ async fn parakeet_cpp_model_present(target: &Path) -> bool {
 fn dugite_git_root_of(d: &str) -> PathBuf {
     node_modules_of(d).join("dugite").join("git")
 }
-fn dugite_git_bin_of(d: &str) -> PathBuf {
+fn git_bin_of_root(root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
-        dugite_git_root_of(d).join("cmd").join("git.exe")
+        root.join("cmd").join("git.exe")
     } else {
-        dugite_git_root_of(d).join("bin").join("git")
+        root.join("bin").join("git")
     }
+}
+fn dugite_git_bin_of(d: &str) -> PathBuf {
+    git_bin_of_root(&dugite_git_root_of(d))
 }
 fn dugite_win32_subfolder() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
@@ -438,18 +379,16 @@ fn dugite_win32_subfolder() -> &'static str {
         "mingw32"
     }
 }
-fn dugite_git_bash_of(d: &str) -> PathBuf {
+fn git_bash_of_root(root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
-        dugite_git_root_of(d)
-            .join(dugite_win32_subfolder())
+        root.join(dugite_win32_subfolder())
             .join("bin")
             .join("bash.exe")
     } else {
-        dugite_git_root_of(d).join("bin").join("bash")
+        root.join("bin").join("bash")
     }
 }
-fn dugite_git_exec_path_of(d: &str) -> PathBuf {
-    let root = dugite_git_root_of(d);
+fn git_exec_path_of_root(root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
         root.join(dugite_win32_subfolder())
             .join("libexec")
@@ -458,30 +397,21 @@ fn dugite_git_exec_path_of(d: &str) -> PathBuf {
         root.join("libexec").join("git-core")
     }
 }
-pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
+
+fn private_git_env(git_root: &Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
+    let git_root_str = git_root.to_string_lossy().to_string();
     let mut launch_path =
         prepend_path_entry(&bun_bin_dir(), &std::env::var("PATH").unwrap_or_default());
     launch_path = prepend_path_entry(&stella_private_bin_dir(), &launch_path);
-    env.insert(
-        "STELLA_DATA_DIR".into(),
-        stella_data_dir().to_string_lossy().to_string(),
-    );
-    let git_root = dugite_git_root_of(install_dir);
-    if !git_root.exists() {
-        env.insert("PATH".into(), launch_path);
-        return env;
-    }
-
-    let git_root_str = git_root.to_string_lossy().to_string();
     env.insert("LOCAL_GIT_DIRECTORY".into(), git_root_str.clone());
     env.insert(
         "STELLA_GIT_BIN".into(),
-        dugite_git_bin_of(install_dir).to_string_lossy().to_string(),
+        git_bin_of_root(git_root).to_string_lossy().to_string(),
     );
     env.insert(
         "GIT_EXEC_PATH".into(),
-        dugite_git_exec_path_of(install_dir)
+        git_exec_path_of_root(git_root)
             .to_string_lossy()
             .to_string(),
     );
@@ -493,17 +423,13 @@ pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
             mingw_root.join("bin").to_string_lossy(),
             mingw_root.join("usr").join("bin").to_string_lossy()
         );
-        launch_path = format!("{path_prefix};{launch_path}");
-        env.insert("PATH".into(), launch_path);
+        env.insert("PATH".into(), format!("{path_prefix};{launch_path}"));
         env.insert(
             "STELLA_GIT_BASH".into(),
-            dugite_git_bash_of(install_dir)
-                .to_string_lossy()
-                .to_string(),
+            git_bash_of_root(git_root).to_string_lossy().to_string(),
         );
     } else {
-        launch_path = format!("{git_root_str}/bin:{launch_path}");
-        env.insert("PATH".into(), launch_path);
+        env.insert("PATH".into(), format!("{git_root_str}/bin:{launch_path}"));
         env.insert(
             "GIT_CONFIG_SYSTEM".into(),
             git_root
@@ -522,7 +448,29 @@ pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
                 .to_string(),
         );
     }
+    env
+}
 
+pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
+    let mut launch_path =
+        prepend_path_entry(&bun_bin_dir(), &std::env::var("PATH").unwrap_or_default());
+    launch_path = prepend_path_entry(&stella_private_bin_dir(), &launch_path);
+    let mut env = HashMap::new();
+    env.insert(
+        "STELLA_DATA_DIR".into(),
+        stella_data_dir().to_string_lossy().to_string(),
+    );
+    let git_root = dugite_git_root_of(install_dir);
+    if !git_root.exists() {
+        env.insert("PATH".into(), launch_path);
+        return env;
+    }
+
+    env.extend(private_git_env(&git_root));
+    env.insert(
+        "STELLA_DATA_DIR".into(),
+        stella_data_dir().to_string_lossy().to_string(),
+    );
     env
 }
 
@@ -604,15 +552,54 @@ async fn write_install_manifest_atomic(
 struct DesktopDownloadManifest {
     schema_version: u32,
     tag: String,
+    commit: String,
     assets: HashMap<String, DesktopDownloadAsset>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDownloadAsset {
+    #[allow(dead_code)]
+    url: String,
+    #[allow(dead_code)]
+    sha256: String,
+    #[allow(dead_code)]
+    size: u64,
+    #[serde(default)]
+    artifact_refs: Vec<DesktopArtifactRef>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopArtifactRef {
+    kind: String,
+    platform: String,
+    #[serde(default)]
+    manifest_url: Option<String>,
+    #[serde(default)]
+    manifest_sha: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    built_at: Option<String>,
+    asset: DesktopArtifactAsset,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopArtifactAsset {
     url: String,
     sha256: String,
-    size: u64,
+    #[serde(alias = "size")]
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedDesktopRelease {
+    tag: String,
+    commit: String,
+    platform: String,
+    artifact_refs: Vec<DesktopArtifactRef>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -622,6 +609,8 @@ struct DesktopReleaseManifest {
     tag: String,
     #[serde(default)]
     commit: Option<String>,
+    #[serde(default)]
+    bundled_dependencies: Option<bool>,
     #[allow(dead_code)]
     #[serde(default)]
     files: HashMap<String, ReleaseFileEntry>,
@@ -653,6 +642,83 @@ fn desktop_platform_key() -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PortableGitAsset {
+    file_name: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+}
+
+fn portable_git_asset() -> Option<PortableGitAsset> {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some(PortableGitAsset {
+            file_name: "dugite-native-v2.53.0-f49d009-windows-x64.tar.gz",
+            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-windows-x64.tar.gz",
+            sha256: "f843a87a693bfdabed83b8492bca59db6f64d1168c74d23e2c8dfb7388a97142",
+        })
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some(PortableGitAsset {
+            file_name: "dugite-native-v2.53.0-f49d009-windows-arm64.tar.gz",
+            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-windows-arm64.tar.gz",
+            sha256: "e16e7023942499c093c8520a145bf20287a08d38d8d69197355df154a8598b06",
+        })
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some(PortableGitAsset {
+            file_name: "dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz",
+            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz",
+            sha256: "e561cfc80c755e6f3e938653e81efcd025c9827a5b76dd42778b1159b3fab437",
+        })
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some(PortableGitAsset {
+            file_name: "dugite-native-v2.53.0-f49d009-macOS-x64.tar.gz",
+            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-macOS-x64.tar.gz",
+            sha256: "caf27c36b8834969550535bcd5e58186f970e080d1e175e76d9c1de3aac409ed",
+        })
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some(PortableGitAsset {
+            file_name: "dugite-native-v2.53.0-f49d009-ubuntu-arm64.tar.gz",
+            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-ubuntu-arm64.tar.gz",
+            sha256: "d562ad433ed0dc1907f44a92fc701597bc577c48d07fe69ee7adddfee836ef4c",
+        })
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(PortableGitAsset {
+            file_name: "dugite-native-v2.53.0-f49d009-ubuntu-x64.tar.gz",
+            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-ubuntu-x64.tar.gz",
+            sha256: "b3a85433c8dfde76d21b90938ad2f971653deff4340b1b4d347258c63250eafc",
+        })
+    } else {
+        None
+    }
+}
+
+fn portable_git_cache_dir() -> PathBuf {
+    stella_data_dir()
+        .join("cache")
+        .join("launcher")
+        .join(format!("dugite-{DUGITE_VERSION}"))
+        .join(desktop_platform_key())
+}
+
+fn portable_git_root() -> PathBuf {
+    portable_git_cache_dir().join("git")
+}
+
+fn portable_git_archive_path() -> Result<PathBuf, String> {
+    portable_git_asset()
+        .map(|asset| portable_git_cache_dir().join(asset.file_name))
+        .ok_or_else(|| {
+            format!(
+                "Stella's private Git runtime is not available for {}/{}.",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        })
+}
+
+fn source_clone_dir_of(install_dir: &str) -> PathBuf {
+    Path::new(install_dir).join(".stella-source-clone")
+}
+
 fn native_helpers_dir_of(install_dir: &str) -> PathBuf {
     desktop_dir_of(install_dir)
         .join("native")
@@ -661,10 +727,15 @@ fn native_helpers_dir_of(install_dir: &str) -> PathBuf {
 }
 
 fn normalize_sha256(value: &str) -> Option<String> {
-    value
-        .split_whitespace()
-        .find(|part| part.len() == 64 && part.chars().all(|char| char.is_ascii_hexdigit()))
-        .map(|part| part.to_ascii_lowercase())
+    value.split_whitespace().find_map(|part| {
+        let candidate = part
+            .get(..7)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("sha256:"))
+            .map(|_| &part[7..])
+            .unwrap_or(part);
+        (candidate.len() == 64 && candidate.chars().all(|char| char.is_ascii_hexdigit()))
+            .then(|| candidate.to_ascii_lowercase())
+    })
 }
 
 // ── Settings persistence ────────────────────────────────────────────
@@ -926,7 +997,12 @@ async fn install_payload_dependencies(
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<(), String> {
-    if path_exists(&node_modules_of(install_dir)).await {
+    let bundled_dependencies = read_release_manifest(install_dir)
+        .await
+        .ok()
+        .and_then(|manifest| manifest.bundled_dependencies)
+        .unwrap_or(false);
+    if bundled_dependencies && path_exists(&node_modules_of(install_dir)).await {
         set_step_progress(
             state,
             app,
@@ -1131,7 +1207,9 @@ async fn run_bun_install_with_progress(
         .args(["install", "--frozen-lockfile"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env("PATH", std::env::var("PATH").unwrap_or_default());
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DUGITE_CACHE_DIR", portable_git_cache_dir())
+        .env("STELLA_SKIP_BROWSER_HYDRATE", "1");
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
@@ -1558,16 +1636,355 @@ async fn ensure_ripgrep_provisioned(install_dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ── Tarball download + extract ──────────────────────────────────────
+// ── Clone-based desktop install ─────────────────────────────────────
 
-async fn download_and_extract_release(
+async fn remove_path_if_present(path: &Path) -> Result<(), String> {
+    let Ok(metadata) = fs::symlink_metadata(path).await else {
+        return Ok(());
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path)
+            .await
+            .map_err(|e| format!("Failed to remove {}: {e}", path.to_string_lossy()))
+    } else {
+        fs::remove_file(path)
+            .await
+            .map_err(|e| format!("Failed to remove {}: {e}", path.to_string_lossy()))
+    }
+}
+
+async fn prepare_portable_git(
+    client: &reqwest::Client,
+    install_dir: &str,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<PathBuf, String> {
+    let asset = portable_git_asset().ok_or_else(|| {
+        format!(
+            "Stella's private Git runtime is not available for {}/{}.",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let cache_dir = portable_git_cache_dir();
+    let archive_path = portable_git_archive_path()?;
+    let git_root = portable_git_root();
+    let git_bin = git_bin_of_root(&git_root);
+
+    if path_exists(&git_bin).await {
+        let version_args = vec!["--version".to_string()];
+        if run_private_git(&git_root, None, &version_args)
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            return Ok(git_root);
+        }
+    }
+
+    fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's Git cache: {e}"))?;
+    set_step_progress(
+        state,
+        app,
+        &SetupStepId::Payload,
+        "Preparing Stella's private Git",
+        Some(0.04),
+    );
+    download_archive_with_resume(
+        client,
+        asset.url,
+        &archive_path,
+        None,
+        Some(asset.sha256),
+        install_dir,
+        state,
+        app,
+        SetupStepId::Payload,
+        "Git",
+        0.04,
+        0.12,
+    )
+    .await?;
+
+    remove_path_if_present(&git_root).await?;
+    fs::create_dir_all(&git_root)
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's private Git runtime: {e}"))?;
+    let archive_for_extract = archive_path.clone();
+    let root_for_extract = git_root.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&archive_for_extract)
+            .map_err(|e| format!("Failed to open Stella's Git runtime: {e}"))?;
+        let decoder = GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("Failed to read Stella's Git runtime: {e}"))?
+        {
+            let mut entry =
+                entry.map_err(|e| format!("Failed to read a Git runtime entry: {e}"))?;
+            entry
+                .unpack_in(&root_for_extract)
+                .map_err(|e| format!("Failed to extract Stella's Git runtime: {e}"))?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Git extraction task failed: {e}"))??;
+
+    if !path_exists(&git_bin).await {
+        return Err("Stella's private Git runtime was incomplete.".into());
+    }
+    let version_args = vec!["--version".to_string()];
+    let version_output = run_private_git(&git_root, None, &version_args).await?;
+    if !version_output.status.success() {
+        return Err(git_output_error(
+            "Validating Stella's private Git runtime",
+            &version_output,
+        ));
+    }
+    log_install(
+        install_dir,
+        &format!(
+            "Prepared checksum-verified private Git runtime at {}",
+            git_root.to_string_lossy()
+        ),
+    )
+    .await;
+    Ok(git_root)
+}
+
+async fn run_private_git(
+    git_root: &Path,
+    cwd: Option<&Path>,
+    args: &[String],
+) -> Result<std::process::Output, String> {
+    let git_bin = git_bin_of_root(git_root);
+    let mut command = Command::new(&git_bin);
+    command
+        .args(args)
+        .envs(private_git_env(git_root))
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1");
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x08000000);
+    }
+    command
+        .output()
+        .await
+        .map_err(|e| format!("Could not run Stella's private Git: {e}"))
+}
+
+fn git_output_error(action: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() { stderr } else { stdout };
+    if detail.is_empty() {
+        format!("{action} failed.")
+    } else {
+        format!("{action} failed: {detail}")
+    }
+}
+
+async fn git_stdout(git_root: &Path, cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let owned = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let output = run_private_git(git_root, Some(cwd), &owned).await?;
+    if !output.status.success() {
+        return Err(git_output_error("Git inspection", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn move_clone_into_install(clone_dir: &Path, install_dir: &Path) -> Result<(), String> {
+    let mut entries = fs::read_dir(clone_dir)
+        .await
+        .map_err(|e| format!("Failed to read cloned Stella source: {e}"))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("Failed to read cloned Stella source: {e}"))?
+    {
+        let target = install_dir.join(entry.file_name());
+        remove_path_if_present(&target).await?;
+        fs::rename(entry.path(), &target)
+            .await
+            .map_err(|e| format!("Failed to install cloned Stella source: {e}"))?;
+    }
+    fs::remove_dir(clone_dir)
+        .await
+        .map_err(|e| format!("Failed to finish cloned Stella source: {e}"))
+}
+
+async fn clone_release_source(
+    release: &ResolvedDesktopRelease,
+    git_root: &Path,
     install_dir: &str,
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<(), String> {
+    let install_path = Path::new(install_dir);
+    let existing_git = install_path.join(".git");
+    if path_exists(&existing_git).await {
+        let existing_head = git_stdout(git_root, install_path, &["rev-parse", "HEAD"]).await?;
+        if existing_head == release.commit {
+            log_install(
+                install_dir,
+                &format!("Existing clone already matches {}", release.commit),
+            )
+            .await;
+            return Ok(());
+        }
+        return Err(
+            "The selected Stella folder has different Git history. Choose a new folder or update the existing installation."
+                .into(),
+        );
+    }
+
+    let clone_dir = source_clone_dir_of(install_dir);
+    remove_path_if_present(&clone_dir).await?;
+    set_step_progress(
+        state,
+        app,
+        &SetupStepId::Payload,
+        "Cloning Stella",
+        Some(0.18),
+    );
+    let clone_args = vec![
+        "clone".into(),
+        "--filter=blob:none".into(),
+        "--no-checkout".into(),
+        "--no-tags".into(),
+        STELLA_GITHUB_REMOTE_URL.into(),
+        clone_dir.to_string_lossy().to_string(),
+    ];
+    let clone_output = run_private_git(git_root, None, &clone_args).await?;
+    if !clone_output.status.success() {
+        return Err(git_output_error("Cloning Stella", &clone_output));
+    }
+
+    set_step_progress(
+        state,
+        app,
+        &SetupStepId::Payload,
+        "Checking out this Stella release",
+        Some(0.38),
+    );
+    let checkout_args = vec![
+        "checkout".into(),
+        "--force".into(),
+        "-B".into(),
+        "master".into(),
+        release.commit.clone(),
+    ];
+    let checkout_output = run_private_git(git_root, Some(&clone_dir), &checkout_args).await?;
+    if !checkout_output.status.success() {
+        return Err(git_output_error(
+            "Checking out the Stella release",
+            &checkout_output,
+        ));
+    }
+
+    let remote_head = git_stdout(git_root, &clone_dir, &["rev-parse", "origin/master"]).await?;
+    if remote_head != release.commit {
+        return Err(format!(
+            "Published Stella commit {} did not match origin/master {}.",
+            release.commit, remote_head
+        ));
+    }
+    let upstream_args = vec![
+        "branch".into(),
+        "--set-upstream-to=origin/master".into(),
+        "master".into(),
+    ];
+    let upstream_output = run_private_git(git_root, Some(&clone_dir), &upstream_args).await?;
+    if !upstream_output.status.success() {
+        return Err(git_output_error(
+            "Configuring Stella's update branch",
+            &upstream_output,
+        ));
+    }
+
+    move_clone_into_install(&clone_dir, install_path).await?;
+    let installed_head = git_stdout(git_root, install_path, &["rev-parse", "HEAD"]).await?;
+    if installed_head != release.commit {
+        return Err("Installed Stella clone did not retain the published commit.".into());
+    }
+    let partial_filter = git_stdout(
+        git_root,
+        install_path,
+        &["config", "--get", "remote.origin.partialclonefilter"],
+    )
+    .await?;
+    if partial_filter != "blob:none" {
+        return Err("Installed Stella clone did not retain blobless history.".into());
+    }
+    let status = git_stdout(
+        git_root,
+        install_path,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )
+    .await?;
+    if !status.is_empty() {
+        return Err(
+            "The selected Stella folder contained files that do not match the published release. Choose a new folder."
+                .into(),
+        );
+    }
+    log_install(
+        install_dir,
+        &format!(
+            "Cloned Stella at exact upstream commit {} with blobless history",
+            release.commit
+        ),
+    )
+    .await;
+    Ok(())
+}
+
+async fn write_cloned_release_manifest(
+    install_dir: &str,
+    release: &ResolvedDesktopRelease,
+) -> Result<(), String> {
+    let version = release
+        .tag
+        .strip_prefix("desktop-v")
+        .unwrap_or(&release.tag);
+    let manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "tag": release.tag,
+        "version": version,
+        "platform": release.platform,
+        "commit": release.commit,
+        "bundledDependencies": false,
+        "bundledNativeHelpers": false,
+        "files": {},
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| format!("Failed to serialize Stella release metadata: {e}"))?;
+    fs::write(release_manifest_of(install_dir), bytes)
+        .await
+        .map_err(|e| format!("Failed to write Stella release metadata: {e}"))
+}
+
+async fn download_and_clone_release(
+    install_dir: &str,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<ResolvedDesktopRelease, String> {
     let client = download_client()?;
-    let latest_url = release_latest_download_url();
-    log_install(install_dir, &format!("Downloading {latest_url}")).await;
+    fs::create_dir_all(install_dir)
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's install folder: {e}"))?;
     set_step_progress(
         state,
         app,
@@ -1575,160 +1992,248 @@ async fn download_and_extract_release(
         "Resolving Stella release",
         Some(0.02),
     );
-
-    let r2_asset = match resolve_r2_desktop_asset(&client, install_dir).await {
-        Ok(asset) => Some(asset),
-        Err(err) => {
-            log_install(
-                install_dir,
-                &format!("R2 desktop manifest unavailable; falling back to GitHub: {err}"),
-            )
-            .await;
-            None
-        }
-    };
-
-    let (download_url, expected_sha256, expected_size) = if let Some(asset) = r2_asset {
-        set_step_progress(
-            state,
-            app,
-            &SetupStepId::Payload,
-            "Connecting to Stella downloads",
-            Some(0.04),
-        );
-        (asset.url, Some(asset.sha256), Some(asset.size))
-    } else {
-        set_step_progress(
-            state,
-            app,
-            &SetupStepId::Payload,
-            "Connecting to GitHub",
-            Some(0.04),
-        );
-        let resp = client
-            .get(&latest_url)
-            .header("User-Agent", "stella-launcher")
-            .send()
-            .await
-            .map_err(|e| format!("Download failed: {e}"))?;
-
-        let url = if resp.status().is_success() {
-            latest_url
-        } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            let tag = latest_release_tag()
-                .await
-                .ok_or("Could not find a desktop release. Check your internet connection.")?;
-            let url = release_download_url(&tag);
-            log_install(
-                install_dir,
-                &format!("Latest release had no desktop asset; using tag {tag}: {url}"),
-            )
-            .await;
-            set_step_progress(
-                state,
-                app,
-                &SetupStepId::Payload,
-                "Finding the desktop release",
-                Some(0.05),
-            );
-            let resp = client
-                .get(&url)
-                .header("User-Agent", "stella-launcher")
-                .send()
-                .await
-                .map_err(|e| format!("Download failed: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("Download failed: HTTP {}", resp.status()));
-            }
-            url
-        } else {
-            return Err(format!("Download failed: HTTP {}", resp.status()));
-        };
-        (url, None, None)
-    };
-
-    fs::create_dir_all(install_dir)
-        .await
-        .map_err(|e| format!("mkdir failed: {e}"))?;
-    let archive_path = Path::new(install_dir).join(".stella-desktop-download.tar.zst");
-    let downloaded = download_archive_with_resume(
-        &client,
-        &download_url,
-        &archive_path,
-        expected_size,
-        expected_sha256.as_deref(),
-        install_dir,
-        state,
-        app,
-        SetupStepId::Payload,
-        "Stella",
-        0.05,
-        0.65,
-    )
-    .await?;
+    let release = resolve_r2_desktop_release(&client, install_dir).await?;
+    let git_root = prepare_portable_git(&client, install_dir, state, app).await?;
+    clone_release_source(&release, &git_root, install_dir, state, app).await?;
+    write_cloned_release_manifest(install_dir, &release).await?;
 
     log_install(
         install_dir,
-        &format!("Downloaded {downloaded} bytes, extracting..."),
+        &format!(
+            "Stella source ready at {} ({})",
+            release.tag, release.commit
+        ),
     )
     .await;
     set_step_progress(
         state,
         app,
         &SetupStepId::Payload,
-        "Extracting Stella",
-        Some(0.72),
+        "Stella source is ready",
+        Some(0.45),
     );
+    Ok(release)
+}
 
-    // Decompress zstd then untar — do in blocking task to avoid blocking async runtime
-    let install_path = install_dir.to_string();
-    let archive_path_for_extract = archive_path.clone();
-    let extract_result = tokio::task::spawn_blocking(move || {
-        let archive_file = std::fs::File::open(&archive_path_for_extract)
-            .map_err(|e| format!("open archive failed: {e}"))?;
-        let decoder =
-            zstd::Decoder::new(archive_file).map_err(|e| format!("zstd decompress failed: {e}"))?;
-        let mut archive = tar::Archive::new(decoder);
+fn pinned_artifact<'a>(
+    release: &'a ResolvedDesktopRelease,
+    kind: &str,
+) -> Result<&'a DesktopArtifactRef, String> {
+    release
+        .artifact_refs
+        .iter()
+        .find(|reference| reference.kind == kind && reference.platform == release.platform)
+        .ok_or_else(|| {
+            format!(
+                "Desktop release {} did not pin {kind} for {}.",
+                release.tag, release.platform
+            )
+        })
+}
 
-        std::fs::create_dir_all(&install_path).map_err(|e| format!("mkdir failed: {e}"))?;
-        for relative in ["node_modules", "desktop/native/out"] {
-            let target = Path::new(&install_path).join(relative);
-            if target.exists() {
-                let remove_result = if target.is_dir() {
-                    std::fs::remove_dir_all(&target)
-                } else {
-                    std::fs::remove_file(&target)
-                };
-                remove_result.map_err(|e| format!("remove stale {relative} failed: {e}"))?;
-            }
-        }
-
-        for entry in archive
-            .entries()
-            .map_err(|e| format!("tar read failed: {e}"))?
-        {
-            let mut entry = entry.map_err(|e| format!("tar entry read failed: {e}"))?;
-            entry
-                .unpack_in(&install_path)
-                .map_err(|e| format!("tar extract failed: {e}"))?;
-        }
-
-        Ok::<(), String>(())
+fn validate_pinned_artifact(reference: &DesktopArtifactRef) -> Result<String, String> {
+    if !reference.asset.url.starts_with("https://") || reference.asset.size_bytes == 0 {
+        return Err(format!(
+            "Published {} artifact metadata was invalid.",
+            reference.kind
+        ));
+    }
+    normalize_sha256(&reference.asset.sha256).ok_or_else(|| {
+        format!(
+            "Published {} artifact checksum was invalid.",
+            reference.kind
+        )
     })
-    .await
-    .map_err(|e| format!("Extract task failed: {e}"))
-    .and_then(|result| result);
-    let _ = fs::remove_file(&archive_path).await;
-    extract_result?;
+}
 
-    log_install(install_dir, "Extraction complete").await;
+fn artifact_revision_from_url(url: &str, segment: &str) -> Option<String> {
+    let parts = url.split('/').collect::<Vec<_>>();
+    let index = parts.iter().position(|part| *part == segment)?;
+    let revision = *parts.get(index + 1)?;
+    valid_release_commit(revision).then(|| revision.to_ascii_lowercase())
+}
+
+async fn install_native_helpers_artifact(
+    client: &reqwest::Client,
+    install_dir: &str,
+    release: &ResolvedDesktopRelease,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let reference = pinned_artifact(release, "native-helpers")?;
+    let sha256 = validate_pinned_artifact(reference)?;
+    let archive_path = Path::new(install_dir).join(".stella-native-helpers-download.tar.zst");
+    download_archive_with_resume(
+        client,
+        &reference.asset.url,
+        &archive_path,
+        Some(reference.asset.size_bytes),
+        Some(&sha256),
+        install_dir,
+        state,
+        app,
+        SetupStepId::Payload,
+        "native components",
+        0.48,
+        0.1,
+    )
+    .await?;
+
     set_step_progress(
         state,
         app,
         &SetupStepId::Payload,
-        "Stella files extracted",
-        Some(0.8),
+        "Installing native components",
+        Some(0.59),
     );
+    let target = native_helpers_dir_of(install_dir);
+    remove_path_if_present(&target).await?;
+    fs::create_dir_all(&target)
+        .await
+        .map_err(|e| format!("Failed to prepare native components: {e}"))?;
+    let archive_for_extract = archive_path.clone();
+    let target_for_extract = target.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&archive_for_extract)
+            .map_err(|e| format!("Failed to open native components: {e}"))?;
+        let decoder = zstd::Decoder::new(file)
+            .map_err(|e| format!("Failed to decompress native components: {e}"))?;
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("Failed to read native components: {e}"))?
+        {
+            let mut entry = entry.map_err(|e| format!("Failed to read a native component: {e}"))?;
+            entry
+                .unpack_in(&target_for_extract)
+                .map_err(|e| format!("Failed to install a native component: {e}"))?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("Native component extraction task failed: {e}"))??;
+
+    let marker = serde_json::json!({
+        "schemaVersion": 1,
+        "sourceManifestUrl": reference.manifest_url,
+        "platform": reference.platform,
+        "helperPlatformDir": native_helpers_platform_dir(),
+        "sha": reference.manifest_sha,
+        "commit": reference.commit,
+        "builtAt": reference.built_at,
+        "installedAt": chrono_now(),
+        "installMode": "archive",
+        "asset": {
+            "url": reference.asset.url,
+            "sha256": sha256,
+            "size": reference.asset.size_bytes,
+        },
+    });
+    fs::write(
+        target.join(".stella-native-helpers.json"),
+        serde_json::to_vec_pretty(&marker)
+            .map_err(|e| format!("Failed to serialize native component metadata: {e}"))?,
+    )
+    .await
+    .map_err(|e| format!("Failed to write native component metadata: {e}"))?;
+    let _ = fs::remove_file(&archive_path).await;
+    Ok(())
+}
+
+async fn install_browser_artifact(
+    client: &reqwest::Client,
+    install_dir: &str,
+    release: &ResolvedDesktopRelease,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let reference = pinned_artifact(release, "stella-browser")?;
+    let sha256 = validate_pinned_artifact(reference)?;
+    let temp_path = Path::new(install_dir).join(".stella-browser-download");
+    download_archive_with_resume(
+        client,
+        &reference.asset.url,
+        &temp_path,
+        Some(reference.asset.size_bytes),
+        Some(&sha256),
+        install_dir,
+        state,
+        app,
+        SetupStepId::Payload,
+        "browser service",
+        0.6,
+        0.08,
+    )
+    .await?;
+
+    let target_dir = desktop_dir_of(install_dir)
+        .join("stella-browser")
+        .join("out")
+        .join(&release.platform);
+    fs::create_dir_all(&target_dir)
+        .await
+        .map_err(|e| format!("Failed to prepare browser service: {e}"))?;
+    let binary_name = if cfg!(target_os = "windows") {
+        "stella-browser.exe"
+    } else {
+        "stella-browser"
+    };
+    let binary_path = target_dir.join(binary_name);
+    remove_path_if_present(&binary_path).await?;
+    fs::rename(&temp_path, &binary_path)
+        .await
+        .map_err(|e| format!("Failed to install browser service: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&binary_path)
+            .await
+            .map_err(|e| format!("Failed to inspect browser service: {e}"))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary_path, permissions)
+            .await
+            .map_err(|e| format!("Failed to mark browser service executable: {e}"))?;
+    }
+
+    let source_sha = artifact_revision_from_url(&reference.asset.url, "stella-browser");
+    let marker = serde_json::json!({
+        "schemaVersion": 1,
+        "sourceManifestUrl": serde_json::Value::Null,
+        "sourceManifestFile": serde_json::Value::Null,
+        "sourceSha": source_sha,
+        "platform": reference.platform,
+        "asset": {
+            "url": reference.asset.url,
+            "sha256": sha256,
+            "size": reference.asset.size_bytes,
+        },
+        "installedAt": chrono_now(),
+    });
+    fs::write(
+        target_dir.join(".stella-browser.json"),
+        serde_json::to_vec_pretty(&marker)
+            .map_err(|e| format!("Failed to serialize browser service metadata: {e}"))?,
+    )
+    .await
+    .map_err(|e| format!("Failed to write browser service metadata: {e}"))?;
+    Ok(())
+}
+
+async fn install_release_artifacts(
+    install_dir: &str,
+    release: &ResolvedDesktopRelease,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let client = download_client()?;
+    install_native_helpers_artifact(&client, install_dir, release, state, app).await?;
+    install_browser_artifact(&client, install_dir, release, state, app).await?;
+    log_install(
+        install_dir,
+        "Installed release-pinned native components and browser service",
+    )
+    .await;
     Ok(())
 }
 
@@ -2080,10 +2585,14 @@ async fn download_archive_with_resume(
     Err(last_err.unwrap_or_else(|| format!("{item_label} download failed.")))
 }
 
-async fn resolve_r2_desktop_asset(
+fn valid_release_commit(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.chars().all(|char| char.is_ascii_hexdigit())
+}
+
+async fn resolve_r2_desktop_release(
     client: &reqwest::Client,
     install_dir: &str,
-) -> Result<DesktopDownloadAsset, String> {
+) -> Result<ResolvedDesktopRelease, String> {
     let manifest_url = desktop_release_manifest_url();
     log_install(
         install_dir,
@@ -2096,19 +2605,38 @@ async fn resolve_r2_desktop_asset(
     if manifest.schema_version != 1 {
         return Err("Desktop release manifest schema is not supported.".into());
     }
+    if manifest.tag.trim().is_empty() || !valid_release_commit(&manifest.commit) {
+        return Err("Desktop release manifest did not identify a valid Git commit.".into());
+    }
     let platform = desktop_platform_key();
     let asset = manifest.assets.get(platform).cloned().ok_or_else(|| {
         format!("Desktop release manifest did not include an asset for {platform}.")
     })?;
+    for required_kind in ["native-helpers", "stella-browser"] {
+        if !asset
+            .artifact_refs
+            .iter()
+            .any(|reference| reference.kind == required_kind && reference.platform == platform)
+        {
+            return Err(format!(
+                "Desktop release manifest did not pin {required_kind} for {platform}."
+            ));
+        }
+    }
     log_install(
         install_dir,
         &format!(
-            "Resolved desktop release {} for {platform}: {}",
-            manifest.tag, asset.url
+            "Resolved desktop release {} at {} for {platform}",
+            manifest.tag, manifest.commit
         ),
     )
     .await;
-    Ok(asset)
+    Ok(ResolvedDesktopRelease {
+        tag: manifest.tag,
+        commit: manifest.commit.to_ascii_lowercase(),
+        platform: platform.to_string(),
+        artifact_refs: asset.artifact_refs,
+    })
 }
 
 async fn read_release_manifest_at(path: &Path) -> Result<DesktopReleaseManifest, String> {
@@ -2610,16 +3138,23 @@ async fn install_step(
         }
         SetupStepId::Payload => {
             let _ = fs::create_dir_all(&dir).await;
-            download_and_extract_release(&dir, state, app).await?;
+            let release = download_and_clone_release(&dir, state, app).await?;
             write_default_env_file(&dir).await?;
+            install_release_artifacts(&dir, &release, state, app).await?;
             set_step_progress(
                 state,
                 app,
                 &SetupStepId::Payload,
-                "Writing app configuration",
-                Some(0.81),
+                "Installing Stella's dependencies",
+                Some(0.8),
             );
             install_payload_dependencies(&dir, state, app).await?;
+            if !path_exists(&dugite_git_bin_of(&dir)).await {
+                return Err(
+                    "Stella's installed Git runtime was missing after dependency setup.".into(),
+                );
+            }
+            let _ = remove_path_if_present(&portable_git_root()).await;
             Ok(())
         }
         SetupStepId::Parakeet => {
@@ -2636,9 +3171,6 @@ async fn install_step(
             }
             let script_path = write_launch_script(&dir, state.low_resource_mode).await;
             let release_manifest = read_release_manifest(&dir).await.ok();
-
-            // Init git repo for self-mod in the background so install completion
-            // does not wait on indexing tens of thousands of extracted files.
 
             let manifest = Manifest {
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -2659,6 +3191,9 @@ async fn install_step(
 
             write_install_manifest_atomic(&manifest_of(&dir), &manifest).await?;
 
+            // Fresh installs are already exact upstream clones. This remains a
+            // cheap background repair/identity pass for older or interrupted
+            // installations.
             schedule_git_repo_init(dir.clone());
 
             write_registry(&manifest).await;
@@ -3251,6 +3786,22 @@ mod tests {
     }
 
     #[test]
+    fn location_error_allows_interrupted_clone_dirs() {
+        let dir = TestDir::new("partial-clone");
+        fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
+        let clone_dir = dir.path.join(".stella-source-clone");
+        fs::create_dir_all(clone_dir.join(".git")).expect("create partial clone");
+        fs::write(
+            clone_dir.join(".git").join("HEAD"),
+            "ref: refs/heads/master\n",
+        )
+        .expect("write partial clone head");
+
+        assert_eq!(location_error(&dir.path.to_string_lossy()), None);
+        assert!(is_uninstallable_install_path(&dir.path.to_string_lossy()));
+    }
+
+    #[test]
     fn uninstallable_install_path_requires_stella_shape() {
         let dir = TestDir::new("uninstallable");
         assert!(!is_uninstallable_install_path(&dir.path.to_string_lossy()));
@@ -3366,6 +3917,104 @@ mod tests {
         headers.insert(CONTENT_RANGE, "bytes 100-199/*".parse().unwrap());
 
         assert_eq!(content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn portable_git_asset_matches_dugite_cache_contract() {
+        let asset = portable_git_asset().expect("supported test platform");
+        assert!(asset.file_name.starts_with("dugite-native-v2.53.0-"));
+        assert!(asset.url.ends_with(asset.file_name));
+        assert_eq!(asset.sha256.len(), 64);
+        assert!(asset.sha256.chars().all(|char| char.is_ascii_hexdigit()));
+        assert!(portable_git_archive_path()
+            .expect("portable Git archive path")
+            .ends_with(asset.file_name));
+    }
+
+    #[test]
+    fn desktop_download_manifest_parses_clone_and_artifact_pins() {
+        let platform = desktop_platform_key();
+        let raw = format!(
+            r#"{{
+                "schemaVersion": 1,
+                "tag": "desktop-v0.0.447",
+                "commit": "d38ddd8b2ef51bca13056bbddc42d55312371760",
+                "assets": {{
+                    "{platform}": {{
+                        "url": "https://example.test/legacy.tar.zst",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "size": 123,
+                        "artifactRefs": [
+                            {{
+                                "kind": "native-helpers",
+                                "platform": "{platform}",
+                                "asset": {{
+                                    "url": "https://example.test/native.tar.zst",
+                                    "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                    "sizeBytes": 456
+                                }}
+                            }},
+                            {{
+                                "kind": "stella-browser",
+                                "platform": "{platform}",
+                                "asset": {{
+                                    "url": "https://example.test/stella-browser",
+                                    "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                                    "sizeBytes": 789
+                                }}
+                            }}
+                        ]
+                    }}
+                }}
+            }}"#
+        );
+        let manifest =
+            serde_json::from_str::<DesktopDownloadManifest>(&raw).expect("desktop manifest");
+        let asset = manifest.assets.get(platform).expect("platform asset");
+
+        assert!(valid_release_commit(&manifest.commit));
+        assert_eq!(asset.artifact_refs.len(), 2);
+        assert_eq!(asset.artifact_refs[0].asset.size_bytes, 456);
+        assert_eq!(
+            validate_pinned_artifact(&asset.artifact_refs[1]).as_deref(),
+            Ok("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+    }
+
+    #[test]
+    fn browser_revision_is_recovered_from_immutable_artifact_url() {
+        assert_eq!(
+            artifact_revision_from_url(
+                "https://cdn.test/stella-browser/b62793bb4474d6d6c2d363f92e8a960432ef1edf/darwin-arm64/stella-browser",
+                "stella-browser",
+            )
+            .as_deref(),
+            Some("b62793bb4474d6d6c2d363f92e8a960432ef1edf")
+        );
+    }
+
+    #[test]
+    fn cloned_release_manifest_records_exact_upstream_commit() {
+        let dir = TestDir::new("cloned-release-manifest");
+        let release = ResolvedDesktopRelease {
+            tag: "desktop-v0.0.447".into(),
+            commit: "d38ddd8b2ef51bca13056bbddc42d55312371760".into(),
+            platform: desktop_platform_key().into(),
+            artifact_refs: Vec::new(),
+        };
+
+        tauri::async_runtime::block_on(write_cloned_release_manifest(
+            &dir.path.to_string_lossy(),
+            &release,
+        ))
+        .expect("write cloned release manifest");
+        let raw = fs::read_to_string(dir.path.join(RELEASE_MANIFEST)).expect("read manifest");
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw).expect("parse manifest");
+
+        assert_eq!(parsed["commit"], release.commit);
+        assert_eq!(parsed["tag"], release.tag);
+        assert_eq!(parsed["bundledDependencies"], false);
+        assert_eq!(parsed["files"], serde_json::json!({}));
     }
 
     #[test]
