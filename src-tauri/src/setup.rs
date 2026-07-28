@@ -200,7 +200,6 @@ fn is_partial_launcher_install_dir(path: &Path) -> bool {
         if file_type.is_file()
             && (name == "stella-install.log"
                 || name == ".DS_Store"
-                || name == ".stella-desktop-download.tar.zst"
                 || name == ".stella-native-helpers-download.tar.zst"
                 || name == ".stella-browser-download")
         {
@@ -553,19 +552,12 @@ struct DesktopDownloadManifest {
     schema_version: u32,
     tag: String,
     commit: String,
-    assets: HashMap<String, DesktopDownloadAsset>,
+    platforms: HashMap<String, DesktopPlatformRelease>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DesktopDownloadAsset {
-    #[allow(dead_code)]
-    url: String,
-    #[allow(dead_code)]
-    sha256: String,
-    #[allow(dead_code)]
-    size: u64,
-    #[serde(default)]
+struct DesktopPlatformRelease {
     artifact_refs: Vec<DesktopArtifactRef>,
 }
 
@@ -609,8 +601,6 @@ struct DesktopReleaseManifest {
     tag: String,
     #[serde(default)]
     commit: Option<String>,
-    #[serde(default)]
-    bundled_dependencies: Option<bool>,
     #[allow(dead_code)]
     #[serde(default)]
     files: HashMap<String, ReleaseFileEntry>,
@@ -997,29 +987,6 @@ async fn install_payload_dependencies(
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<(), String> {
-    let bundled_dependencies = read_release_manifest(install_dir)
-        .await
-        .ok()
-        .and_then(|manifest| manifest.bundled_dependencies)
-        .unwrap_or(false);
-    if bundled_dependencies && path_exists(&node_modules_of(install_dir)).await {
-        set_step_progress(
-            state,
-            app,
-            &SetupStepId::Payload,
-            "Using bundled dependencies",
-            Some(0.9),
-        );
-        log_install(
-            install_dir,
-            "Using bundled desktop dependencies from the release payload",
-        )
-        .await;
-        ensure_electron_binary_installed(install_dir, state, app).await?;
-        prewarm_vite_dep_cache(install_dir, state, app).await;
-        return Ok(());
-    }
-
     let dir = Some(Path::new(install_dir));
     let result = run_bun_install_with_progress(install_dir, dir, state, app).await;
     if result.ok {
@@ -1109,7 +1076,7 @@ async fn ensure_electron_binary_installed(
     app: &AppHandle,
 ) -> Result<(), String> {
     if path_exists(&electron_dist_dir_of(install_dir)).await {
-        log_install(install_dir, "Electron binary already bundled").await;
+        log_install(install_dir, "Electron binary already installed").await;
         return Ok(());
     }
 
@@ -1965,8 +1932,6 @@ async fn write_cloned_release_manifest(
         "version": version,
         "platform": release.platform,
         "commit": release.commit,
-        "bundledDependencies": false,
-        "bundledNativeHelpers": false,
         "files": {},
     });
     let bytes = serde_json::to_vec_pretty(&manifest)
@@ -2602,18 +2567,19 @@ async fn resolve_r2_desktop_release(
     let manifest_text = fetch_required_text(client, &manifest_url).await?;
     let manifest: DesktopDownloadManifest = serde_json::from_str(&manifest_text)
         .map_err(|e| format!("Desktop release manifest was invalid JSON: {e}"))?;
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != 2 {
         return Err("Desktop release manifest schema is not supported.".into());
     }
     if manifest.tag.trim().is_empty() || !valid_release_commit(&manifest.commit) {
         return Err("Desktop release manifest did not identify a valid Git commit.".into());
     }
     let platform = desktop_platform_key();
-    let asset = manifest.assets.get(platform).cloned().ok_or_else(|| {
-        format!("Desktop release manifest did not include an asset for {platform}.")
-    })?;
+    let platform_release =
+        manifest.platforms.get(platform).cloned().ok_or_else(|| {
+            format!("Desktop release manifest did not include platform {platform}.")
+        })?;
     for required_kind in ["native-helpers", "stella-browser"] {
-        if !asset
+        if !platform_release
             .artifact_refs
             .iter()
             .any(|reference| reference.kind == required_kind && reference.platform == platform)
@@ -2635,7 +2601,7 @@ async fn resolve_r2_desktop_release(
         tag: manifest.tag,
         commit: manifest.commit.to_ascii_lowercase(),
         platform: platform.to_string(),
-        artifact_refs: asset.artifact_refs,
+        artifact_refs: platform_release.artifact_refs,
     })
 }
 
@@ -3769,8 +3735,8 @@ mod tests {
         fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
         fs::write(dir.path.join(".DS_Store"), "").expect("write ds store");
         fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
-        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
-            .expect("write temp archive");
+        fs::write(dir.path.join(".stella-browser-download"), "")
+            .expect("write temp browser download");
 
         assert!(location_error(&dir.path.to_string_lossy()).is_some());
     }
@@ -3779,8 +3745,11 @@ mod tests {
     fn location_error_allows_partial_launcher_download_dirs() {
         let dir = TestDir::new("partial-download");
         fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
-        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "partial")
-            .expect("write partial archive");
+        fs::write(
+            dir.path.join(".stella-native-helpers-download.tar.zst"),
+            "partial",
+        )
+        .expect("write partial helpers archive");
 
         assert_eq!(location_error(&dir.path.to_string_lossy()), None);
     }
@@ -3834,8 +3803,8 @@ mod tests {
         fs::write(dir.path.join("state").join("stella.sqlite"), "db").expect("write state file");
         fs::write(dir.path.join(".DS_Store"), "").expect("write ds store");
         fs::write(dir.path.join("stella-install.log"), "log").expect("write log");
-        fs::write(dir.path.join(".stella-desktop-download.tar.zst"), "")
-            .expect("write temp archive");
+        fs::write(dir.path.join(".stella-browser-download"), "")
+            .expect("write temp browser download");
 
         assert!(!is_uninstallable_install_path(&dir.path.to_string_lossy()));
     }
@@ -3936,14 +3905,11 @@ mod tests {
         let platform = desktop_platform_key();
         let raw = format!(
             r#"{{
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "tag": "desktop-v0.0.447",
                 "commit": "d38ddd8b2ef51bca13056bbddc42d55312371760",
-                "assets": {{
+                "platforms": {{
                     "{platform}": {{
-                        "url": "https://example.test/legacy.tar.zst",
-                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "size": 123,
                         "artifactRefs": [
                             {{
                                 "kind": "native-helpers",
@@ -3970,13 +3936,13 @@ mod tests {
         );
         let manifest =
             serde_json::from_str::<DesktopDownloadManifest>(&raw).expect("desktop manifest");
-        let asset = manifest.assets.get(platform).expect("platform asset");
+        let platform_release = manifest.platforms.get(platform).expect("platform release");
 
         assert!(valid_release_commit(&manifest.commit));
-        assert_eq!(asset.artifact_refs.len(), 2);
-        assert_eq!(asset.artifact_refs[0].asset.size_bytes, 456);
+        assert_eq!(platform_release.artifact_refs.len(), 2);
+        assert_eq!(platform_release.artifact_refs[0].asset.size_bytes, 456);
         assert_eq!(
-            validate_pinned_artifact(&asset.artifact_refs[1]).as_deref(),
+            validate_pinned_artifact(&platform_release.artifact_refs[1]).as_deref(),
             Ok("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
         );
     }
@@ -4013,7 +3979,8 @@ mod tests {
 
         assert_eq!(parsed["commit"], release.commit);
         assert_eq!(parsed["tag"], release.tag);
-        assert_eq!(parsed["bundledDependencies"], false);
+        assert!(parsed.get("bundledDependencies").is_none());
+        assert!(parsed.get("bundledNativeHelpers").is_none());
         assert_eq!(parsed["files"], serde_json::json!({}));
     }
 
