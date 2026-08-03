@@ -34,6 +34,8 @@ VITE_SITE_URL=https://stella.sh\n";
 const STELLA_GITHUB_REMOTE_URL: &str = "https://github.com/ruuxi/stella";
 const DEFAULT_DESKTOP_RELEASE_MANIFEST_URL: &str =
     "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/desktop/current.json";
+const DEFAULT_GIT_RUNTIME_MANIFEST_BASE_URL: &str =
+    "https://pub-a319aaada8144dc9be5a83625033769c.r2.dev/git-runtime/versions";
 const INSTALL_DIR_NAME: &str = "stella";
 const DOWNLOAD_RETRY_ATTEMPTS: usize = 5;
 const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -41,7 +43,10 @@ const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOWS_REMOVE_RETRY_TIMEOUT: Duration = Duration::from_secs(15);
 const WINDOWS_REMOVE_RETRY_POLL: Duration = Duration::from_millis(250);
 const RIPGREP_VERSION: &str = "15.1.0";
-const DUGITE_VERSION: &str = "3.2.2";
+const MANAGED_GIT_VERSION: &str = "2.53.0";
+const MANAGED_NODE_VERSION: &str = "24.14.1";
+const MANAGED_PYTHON_VERSION: &str = "3.12";
+const MANAGED_UV_VERSION: &str = "0.11.32";
 
 fn native_helpers_platform_dir() -> &'static str {
     if cfg!(target_os = "windows") {
@@ -251,6 +256,45 @@ fn bun_bin_dir() -> PathBuf {
 fn stella_private_bin_dir() -> PathBuf {
     stella_data_dir().join("bin")
 }
+fn stella_runtimes_dir() -> PathBuf {
+    stella_data_dir().join("runtimes")
+}
+fn managed_node_dir() -> PathBuf {
+    stella_runtimes_dir()
+        .join("node")
+        .join(MANAGED_NODE_VERSION)
+}
+fn managed_node_bin_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        managed_node_dir()
+    } else {
+        managed_node_dir().join("bin")
+    }
+}
+fn managed_node_binary() -> PathBuf {
+    managed_node_bin_dir().join(if cfg!(target_os = "windows") {
+        "node.exe"
+    } else {
+        "node"
+    })
+}
+fn managed_uv_binary() -> PathBuf {
+    stella_private_bin_dir().join(if cfg!(target_os = "windows") {
+        "uv.exe"
+    } else {
+        "uv"
+    })
+}
+fn managed_python_install_dir() -> PathBuf {
+    stella_runtimes_dir().join("python")
+}
+fn python_command_names() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["python.exe", "python3.exe", "python"]
+    } else {
+        &["python3", "python"]
+    }
+}
 fn ripgrep_private_binary_path() -> PathBuf {
     stella_private_bin_dir().join(ripgrep_executable_name())
 }
@@ -268,6 +312,63 @@ fn prepend_path_entry(entry: &Path, existing_path: &str) -> String {
     } else {
         format!("{entry}{}{existing_path}", path_separator())
     }
+}
+
+fn executable_on_path(command: &str) -> Option<PathBuf> {
+    let candidate = Path::new(command);
+    if candidate.components().count() > 1 && candidate.is_file() {
+        return Some(candidate.to_path_buf());
+    }
+
+    let path_value = std::env::var_os("PATH")?;
+    #[cfg(target_os = "windows")]
+    let extensions = {
+        let configured =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        configured
+            .split(';')
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    };
+
+    for directory in std::env::split_paths(&path_value) {
+        let direct = directory.join(command);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        #[cfg(target_os = "windows")]
+        if Path::new(command).extension().is_none() {
+            for extension in &extensions {
+                let with_extension = directory.join(format!("{command}{extension}"));
+                if with_extension.is_file() {
+                    return Some(with_extension);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn command_succeeds(binary: &Path, args: &[&str]) -> bool {
+    command_output(binary, args)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn command_output(binary: &Path, args: &[&str]) -> Option<std::process::Output> {
+    let mut command = std::process::Command::new(binary);
+    command.args(args);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x08000000);
+    }
+    command.output().ok()
+}
+
+fn usable_executable_on_path(command: &str, args: &[&str]) -> Option<PathBuf> {
+    executable_on_path(command).filter(|binary| command_succeeds(binary, args))
 }
 fn mac_screen_capture_permissions_dir_of(d: &str) -> PathBuf {
     node_modules_of(d).join("mac-screen-capture-permissions")
@@ -356,9 +457,6 @@ async fn parakeet_cpp_model_present(target: &Path) -> bool {
         Err(_) => false,
     }
 }
-fn dugite_git_root_of(d: &str) -> PathBuf {
-    node_modules_of(d).join("dugite").join("git")
-}
 fn git_bin_of_root(root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
         root.join("cmd").join("git.exe")
@@ -366,10 +464,7 @@ fn git_bin_of_root(root: &Path) -> PathBuf {
         root.join("bin").join("git")
     }
 }
-fn dugite_git_bin_of(d: &str) -> PathBuf {
-    git_bin_of_root(&dugite_git_root_of(d))
-}
-fn dugite_win32_subfolder() -> &'static str {
+fn managed_git_win32_subfolder() -> &'static str {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         "mingw64"
     } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
@@ -380,21 +475,25 @@ fn dugite_win32_subfolder() -> &'static str {
 }
 fn git_bash_of_root(root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
-        root.join(dugite_win32_subfolder())
-            .join("bin")
-            .join("bash.exe")
+        root.join("usr").join("bin").join("bash.exe")
     } else {
         root.join("bin").join("bash")
     }
 }
 fn git_exec_path_of_root(root: &Path) -> PathBuf {
     if cfg!(target_os = "windows") {
-        root.join(dugite_win32_subfolder())
+        root.join(managed_git_win32_subfolder())
             .join("libexec")
             .join("git-core")
     } else {
         root.join("libexec").join("git-core")
     }
+}
+
+#[derive(Debug, Clone)]
+struct GitRuntime {
+    bin: PathBuf,
+    env: HashMap<String, String>,
 }
 
 fn private_git_env(git_root: &Path) -> HashMap<String, String> {
@@ -416,11 +515,11 @@ fn private_git_env(git_root: &Path) -> HashMap<String, String> {
     );
 
     if cfg!(target_os = "windows") {
-        let mingw_root = git_root.join(dugite_win32_subfolder());
+        let mingw_root = git_root.join(managed_git_win32_subfolder());
         let path_prefix = format!(
             "{};{}",
             mingw_root.join("bin").to_string_lossy(),
-            mingw_root.join("usr").join("bin").to_string_lossy()
+            git_root.join("usr").join("bin").to_string_lossy()
         );
         env.insert("PATH".into(), format!("{path_prefix};{launch_path}"));
         env.insert(
@@ -450,7 +549,151 @@ fn private_git_env(git_root: &Path) -> HashMap<String, String> {
     env
 }
 
-pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
+fn system_git_bash(git_bin: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    let root = git_bin.parent()?.parent()?;
+    [
+        root.join("bin").join("bash.exe"),
+        root.join("usr").join("bin").join("bash.exe"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file() && command_succeeds(candidate, &["--version"]))
+}
+
+fn system_git_runtime() -> Option<GitRuntime> {
+    let bin = usable_executable_on_path(
+        if cfg!(target_os = "windows") {
+            "git.exe"
+        } else {
+            "git"
+        },
+        &["--version"],
+    )?;
+    let mut env = HashMap::new();
+    env.insert("STELLA_GIT_BIN".into(), bin.to_string_lossy().to_string());
+    if cfg!(target_os = "windows") {
+        let bash = system_git_bash(&bin)?;
+        env.insert("STELLA_GIT_BASH".into(), bash.to_string_lossy().to_string());
+    }
+    Some(GitRuntime { bin, env })
+}
+
+fn managed_git_runtime() -> Option<GitRuntime> {
+    let root = managed_git_root();
+    let bin = git_bin_of_root(&root);
+    if !bin.is_file() || !command_succeeds(&bin, &["--version"]) {
+        return None;
+    }
+    Some(GitRuntime {
+        bin,
+        env: private_git_env(&root),
+    })
+}
+
+fn available_git_runtime() -> Option<GitRuntime> {
+    system_git_runtime().or_else(managed_git_runtime)
+}
+
+fn node_version_is_usable(binary: &Path) -> bool {
+    let Some(output) = command_output(binary, &["--version"]) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let Some(major) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+        return false;
+    };
+    let minor = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    major > 20 || (major == 20 && minor >= 19)
+}
+
+fn system_node_binary() -> Option<PathBuf> {
+    let node = executable_on_path(if cfg!(target_os = "windows") {
+        "node.exe"
+    } else {
+        "node"
+    })
+    .filter(|binary| node_version_is_usable(binary))?;
+    let npm_name = if cfg!(target_os = "windows") {
+        "npm.cmd"
+    } else {
+        "npm"
+    };
+    let npx_name = if cfg!(target_os = "windows") {
+        "npx.cmd"
+    } else {
+        "npx"
+    };
+    usable_executable_on_path(npm_name, &["--version"])?;
+    usable_executable_on_path(npx_name, &["--version"])?;
+    Some(node)
+}
+
+fn managed_node_is_usable() -> bool {
+    if !node_version_is_usable(&managed_node_binary()) {
+        return false;
+    }
+    let npm = managed_node_bin_dir().join(if cfg!(target_os = "windows") {
+        "npm.cmd"
+    } else {
+        "npm"
+    });
+    let npx = managed_node_bin_dir().join(if cfg!(target_os = "windows") {
+        "npx.cmd"
+    } else {
+        "npx"
+    });
+    npm.is_file() && npx.is_file()
+}
+
+fn available_node_binary() -> Option<PathBuf> {
+    system_node_binary().or_else(|| {
+        let managed = managed_node_binary();
+        managed_node_is_usable().then_some(managed)
+    })
+}
+
+fn python_version_is_usable(binary: &Path) -> bool {
+    if cfg!(target_os = "windows")
+        && binary
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("\\windowsapps\\")
+    {
+        // The Microsoft Store app-execution alias can open UI when invoked;
+        // it is not an installed interpreter and must not count as the fast path.
+        return false;
+    }
+    command_succeeds(
+        binary,
+        &[
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)",
+        ],
+    )
+}
+
+fn available_python_binary() -> Option<PathBuf> {
+    python_command_names()
+        .iter()
+        .find_map(|name| executable_on_path(name).filter(|path| python_version_is_usable(path)))
+        .or_else(|| {
+            python_command_names().iter().find_map(|name| {
+                let candidate = stella_private_bin_dir().join(name);
+                python_version_is_usable(&candidate).then_some(candidate)
+            })
+        })
+}
+
+pub fn runtime_launch_env(_install_dir: &str) -> HashMap<String, String> {
     let mut launch_path =
         prepend_path_entry(&bun_bin_dir(), &std::env::var("PATH").unwrap_or_default());
     launch_path = prepend_path_entry(&stella_private_bin_dir(), &launch_path);
@@ -459,17 +702,46 @@ pub fn dugite_launch_env(install_dir: &str) -> HashMap<String, String> {
         "STELLA_DATA_DIR".into(),
         stella_data_dir().to_string_lossy().to_string(),
     );
-    let git_root = dugite_git_root_of(install_dir);
-    if !git_root.exists() {
-        env.insert("PATH".into(), launch_path);
-        return env;
+    if let Some(git) = available_git_runtime() {
+        if let Some(git_path) = git.env.get("PATH") {
+            launch_path = git_path.clone();
+        } else if let Some(parent) = git.bin.parent() {
+            launch_path = prepend_path_entry(parent, &launch_path);
+        }
+        env.extend(git.env);
     }
-
-    env.extend(private_git_env(&git_root));
-    env.insert(
-        "STELLA_DATA_DIR".into(),
-        stella_data_dir().to_string_lossy().to_string(),
-    );
+    if let Some(node) = available_node_binary() {
+        if let Some(parent) = node.parent() {
+            launch_path = prepend_path_entry(parent, &launch_path);
+        }
+        env.insert("STELLA_NODE_BIN".into(), node.to_string_lossy().to_string());
+        env.insert("STELLA_NODE_IS_ELECTRON".into(), "0".into());
+    }
+    if let Some(python) = available_python_binary() {
+        if let Some(parent) = python.parent() {
+            launch_path = prepend_path_entry(parent, &launch_path);
+        }
+        env.insert(
+            "STELLA_PYTHON_BIN".into(),
+            python.to_string_lossy().to_string(),
+        );
+    }
+    if let Some(uv) = usable_executable_on_path(
+        if cfg!(target_os = "windows") {
+            "uv.exe"
+        } else {
+            "uv"
+        },
+        &["--version"],
+    )
+    .or_else(|| {
+        let managed = managed_uv_binary();
+        command_succeeds(&managed, &["--version"]).then_some(managed)
+    }) {
+        env.insert("STELLA_UV_BIN".into(), uv.to_string_lossy().to_string());
+    }
+    launch_path = prepend_path_entry(&stella_private_bin_dir(), &launch_path);
+    env.insert("PATH".into(), launch_path);
     env
 }
 
@@ -632,77 +904,174 @@ fn desktop_platform_key() -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedGitAsset {
+    file_name: String,
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedGitManifest {
+    schema_version: u32,
+    version: String,
+    assets: HashMap<String, ManagedGitAsset>,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct PortableGitAsset {
+struct ManagedNodeAsset {
     file_name: &'static str,
     url: &'static str,
     sha256: &'static str,
 }
 
-fn portable_git_asset() -> Option<PortableGitAsset> {
+fn managed_node_asset() -> Option<ManagedNodeAsset> {
     if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Some(PortableGitAsset {
-            file_name: "dugite-native-v2.53.0-f49d009-windows-x64.tar.gz",
-            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-windows-x64.tar.gz",
-            sha256: "f843a87a693bfdabed83b8492bca59db6f64d1168c74d23e2c8dfb7388a97142",
+        Some(ManagedNodeAsset {
+            file_name: "node-v24.14.1-win-x64.zip",
+            url: "https://nodejs.org/dist/v24.14.1/node-v24.14.1-win-x64.zip",
+            sha256: "6e50ce5498c0cebc20fd39ab3ff5df836ed2f8a31aa093cecad8497cff126d70",
         })
     } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        Some(PortableGitAsset {
-            file_name: "dugite-native-v2.53.0-f49d009-windows-arm64.tar.gz",
-            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-windows-arm64.tar.gz",
-            sha256: "e16e7023942499c093c8520a145bf20287a08d38d8d69197355df154a8598b06",
+        Some(ManagedNodeAsset {
+            file_name: "node-v24.14.1-win-arm64.zip",
+            url: "https://nodejs.org/dist/v24.14.1/node-v24.14.1-win-arm64.zip",
+            sha256: "a7b7c68490e4a8cde1921fe5a0cfb3001d53f9c839e416903e4f28e727b62f60",
         })
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        Some(PortableGitAsset {
-            file_name: "dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz",
-            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz",
-            sha256: "e561cfc80c755e6f3e938653e81efcd025c9827a5b76dd42778b1159b3fab437",
+        Some(ManagedNodeAsset {
+            file_name: "node-v24.14.1-darwin-arm64.tar.gz",
+            url: "https://nodejs.org/dist/v24.14.1/node-v24.14.1-darwin-arm64.tar.gz",
+            sha256: "25495ff85bd89e2d8a24d88566d7e2f827c6b0d3d872b2cebf75371f93fcb1fe",
         })
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        Some(PortableGitAsset {
-            file_name: "dugite-native-v2.53.0-f49d009-macOS-x64.tar.gz",
-            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-macOS-x64.tar.gz",
-            sha256: "caf27c36b8834969550535bcd5e58186f970e080d1e175e76d9c1de3aac409ed",
+        Some(ManagedNodeAsset {
+            file_name: "node-v24.14.1-darwin-x64.tar.gz",
+            url: "https://nodejs.org/dist/v24.14.1/node-v24.14.1-darwin-x64.tar.gz",
+            sha256: "2526230ad7d922be82d4fdb1e7ee1e84303e133e3b4b0ec4c2897ab31de0253d",
         })
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        Some(PortableGitAsset {
-            file_name: "dugite-native-v2.53.0-f49d009-ubuntu-arm64.tar.gz",
-            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-ubuntu-arm64.tar.gz",
-            sha256: "d562ad433ed0dc1907f44a92fc701597bc577c48d07fe69ee7adddfee836ef4c",
+        Some(ManagedNodeAsset {
+            file_name: "node-v24.14.1-linux-arm64.tar.gz",
+            url: "https://nodejs.org/dist/v24.14.1/node-v24.14.1-linux-arm64.tar.gz",
+            sha256: "734ff04fa7f8ed2e8a78d40cacf5ac3fc4515dac2858757cbab313eb483ba8a2",
         })
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        Some(PortableGitAsset {
-            file_name: "dugite-native-v2.53.0-f49d009-ubuntu-x64.tar.gz",
-            url: "https://github.com/desktop/dugite-native/releases/download/v2.53.0-3/dugite-native-v2.53.0-f49d009-ubuntu-x64.tar.gz",
-            sha256: "b3a85433c8dfde76d21b90938ad2f971653deff4340b1b4d347258c63250eafc",
+        Some(ManagedNodeAsset {
+            file_name: "node-v24.14.1-linux-x64.tar.gz",
+            url: "https://nodejs.org/dist/v24.14.1/node-v24.14.1-linux-x64.tar.gz",
+            sha256: "ace9fa104992ed0829642629c46ca7bd7fd6e76278cb96c958c4b387d29658ea",
         })
     } else {
         None
     }
 }
 
-fn portable_git_cache_dir() -> PathBuf {
+fn managed_node_cache_dir() -> PathBuf {
     stella_data_dir()
         .join("cache")
         .join("launcher")
-        .join(format!("dugite-{DUGITE_VERSION}"))
-        .join(desktop_platform_key())
+        .join("node")
+        .join(MANAGED_NODE_VERSION)
 }
 
-fn portable_git_root() -> PathBuf {
-    portable_git_cache_dir().join("git")
-}
-
-fn portable_git_archive_path() -> Result<PathBuf, String> {
-    portable_git_asset()
-        .map(|asset| portable_git_cache_dir().join(asset.file_name))
+fn managed_node_archive_path() -> Result<PathBuf, String> {
+    managed_node_asset()
+        .map(|asset| managed_node_cache_dir().join(asset.file_name))
         .ok_or_else(|| {
             format!(
-                "Stella's private Git runtime is not available for {}/{}.",
+                "Stella's managed Node runtime is not available for {}/{}.",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             )
         })
+}
+
+fn managed_runtime_platform_key() -> Option<&'static str> {
+    if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("win-x64")
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        Some("win-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        Some("darwin-arm64")
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        Some("darwin-x64")
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        Some("linux-arm64")
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some("linux-x64")
+    } else {
+        None
+    }
+}
+
+fn git_runtime_manifest_url() -> String {
+    std::env::var("STELLA_GIT_RUNTIME_MANIFEST_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            format!("{DEFAULT_GIT_RUNTIME_MANIFEST_BASE_URL}/{MANAGED_GIT_VERSION}/manifest.json")
+        })
+}
+
+fn resolve_managed_git_asset(manifest: ManagedGitManifest) -> Result<ManagedGitAsset, String> {
+    if manifest.schema_version != 1 {
+        return Err("Git runtime manifest schema is not supported.".into());
+    }
+    if manifest.version != MANAGED_GIT_VERSION {
+        return Err(format!(
+            "Git runtime manifest version did not match {MANAGED_GIT_VERSION}."
+        ));
+    }
+    let platform = managed_runtime_platform_key().ok_or_else(|| {
+        format!(
+            "Stella's private Git runtime is not available for {}/{}.",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let mut asset = manifest
+        .assets
+        .get(platform)
+        .cloned()
+        .ok_or_else(|| format!("Git runtime manifest did not include platform {platform}."))?;
+    let expected_file_name = format!("stella-git-{platform}.tar.gz");
+    if asset.file_name != expected_file_name
+        || Path::new(&asset.file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(asset.file_name.as_str())
+    {
+        return Err("Git runtime manifest contained an invalid archive name.".into());
+    }
+    if !asset.url.starts_with("https://") {
+        return Err("Git runtime manifest contained an invalid artifact URL.".into());
+    }
+    asset.sha256 = normalize_sha256(&asset.sha256)
+        .ok_or_else(|| "Git runtime manifest contained an invalid checksum.".to_string())?;
+    if asset.size == 0 {
+        return Err("Git runtime manifest contained an invalid artifact size.".into());
+    }
+    Ok(asset)
+}
+
+fn managed_git_dir() -> PathBuf {
+    stella_runtimes_dir()
+        .join("git")
+        .join(MANAGED_GIT_VERSION)
+        .join(managed_runtime_platform_key().unwrap_or("unsupported"))
+}
+
+fn managed_git_root() -> PathBuf {
+    managed_git_dir().join("git")
+}
+
+fn managed_git_archive_path(asset: &ManagedGitAsset) -> PathBuf {
+    managed_git_dir().join(&asset.file_name)
 }
 
 fn source_clone_dir_of(install_dir: &str) -> PathBuf {
@@ -760,7 +1129,7 @@ async fn write_settings(ctx: &InstallerContext, state: &InstallerState) {
 
 async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> String {
     let script_path = launch_script_of(install_dir);
-    let launch_env = dugite_launch_env(install_dir);
+    let launch_env = runtime_launch_env(install_dir);
     let launch_command = desktop_launch_command_line(low_resource_mode);
 
     if cfg!(target_os = "windows") {
@@ -779,6 +1148,16 @@ async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> Stri
         }
         if let Some(stella_data_dir) = launch_env.get("STELLA_DATA_DIR") {
             content.push_str(&format!("set \"STELLA_DATA_DIR={stella_data_dir}\"\r\n"));
+        }
+        for key in [
+            "STELLA_NODE_BIN",
+            "STELLA_NODE_IS_ELECTRON",
+            "STELLA_PYTHON_BIN",
+            "STELLA_UV_BIN",
+        ] {
+            if let Some(value) = launch_env.get(key) {
+                content.push_str(&format!("set \"{key}={value}\"\r\n"));
+            }
         }
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("set \"PATH={path_value}\"\r\n"));
@@ -810,6 +1189,16 @@ async fn write_launch_script(install_dir: &str, low_resource_mode: bool) -> Stri
         }
         if let Some(stella_data_dir) = launch_env.get("STELLA_DATA_DIR") {
             content.push_str(&format!("export STELLA_DATA_DIR=\"{stella_data_dir}\"\n"));
+        }
+        for key in [
+            "STELLA_NODE_BIN",
+            "STELLA_NODE_IS_ELECTRON",
+            "STELLA_PYTHON_BIN",
+            "STELLA_UV_BIN",
+        ] {
+            if let Some(value) = launch_env.get(key) {
+                content.push_str(&format!("export {key}=\"{value}\"\n"));
+            }
         }
         if let Some(path_value) = launch_env.get("PATH") {
             content.push_str(&format!("export PATH=\"{path_value}\"\n"));
@@ -1175,14 +1564,12 @@ async fn run_bun_install_with_progress(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("DUGITE_CACHE_DIR", portable_git_cache_dir())
         .env("STELLA_SKIP_BROWSER_HYDRATE", "1");
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt as _;
         command.creation_flags(0x08000000);
     }
 
@@ -1620,44 +2007,29 @@ async fn remove_path_if_present(path: &Path) -> Result<(), String> {
     }
 }
 
-async fn prepare_portable_git(
+async fn install_managed_node(
     client: &reqwest::Client,
     install_dir: &str,
     state: &mut InstallerState,
     app: &AppHandle,
 ) -> Result<PathBuf, String> {
-    let asset = portable_git_asset().ok_or_else(|| {
+    let asset = managed_node_asset().ok_or_else(|| {
         format!(
-            "Stella's private Git runtime is not available for {}/{}.",
+            "Stella's managed Node runtime is not available for {}/{}.",
             std::env::consts::OS,
             std::env::consts::ARCH
         )
     })?;
-    let cache_dir = portable_git_cache_dir();
-    let archive_path = portable_git_archive_path()?;
-    let git_root = portable_git_root();
-    let git_bin = git_bin_of_root(&git_root);
-
-    if path_exists(&git_bin).await {
-        let version_args = vec!["--version".to_string()];
-        if run_private_git(&git_root, None, &version_args)
-            .await
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
-            return Ok(git_root);
-        }
-    }
-
-    fs::create_dir_all(&cache_dir)
+    let archive_path = managed_node_archive_path()?;
+    fs::create_dir_all(managed_node_cache_dir())
         .await
-        .map_err(|e| format!("Failed to prepare Stella's Git cache: {e}"))?;
+        .map_err(|e| format!("Failed to prepare Stella's Node cache: {e}"))?;
     set_step_progress(
         state,
         app,
-        &SetupStepId::Payload,
-        "Preparing Stella's private Git",
-        Some(0.04),
+        &SetupStepId::Runtime,
+        "Installing Stella's managed Node runtime",
+        Some(0.35),
     );
     download_archive_with_resume(
         client,
@@ -1668,7 +2040,415 @@ async fn prepare_portable_git(
         install_dir,
         state,
         app,
-        SetupStepId::Payload,
+        SetupStepId::Runtime,
+        "Node",
+        0.35,
+        0.2,
+    )
+    .await?;
+
+    let target = managed_node_dir();
+    let staging = target
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{MANAGED_NODE_VERSION}-extracting"));
+    remove_path_if_present(&staging).await?;
+    remove_path_if_present(&target).await?;
+    fs::create_dir_all(&staging)
+        .await
+        .map_err(|e| format!("Failed to prepare Node extraction: {e}"))?;
+
+    if cfg!(target_os = "windows") {
+        let archive = archive_path.to_string_lossy().to_string();
+        let destination = staging.to_string_lossy().to_string();
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!(
+                "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
+                archive.replace('\'', "''"),
+                destination.replace('\'', "''")
+            ),
+        ]);
+        #[cfg(target_os = "windows")]
+        {
+            command.creation_flags(0x08000000);
+        }
+        let output = command
+            .output()
+            .await
+            .map_err(|e| format!("Failed to extract Node: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to extract Node: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let mut entries = fs::read_dir(&staging)
+            .await
+            .map_err(|e| format!("Failed to inspect Node archive: {e}"))?;
+        let extracted_root = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("Failed to inspect Node archive: {e}"))?
+            .map(|entry| entry.path())
+            .ok_or_else(|| "Node archive was empty.".to_string())?;
+        fs::rename(&extracted_root, &target)
+            .await
+            .map_err(|e| format!("Failed to install Node: {e}"))?;
+        remove_path_if_present(&staging).await?;
+    } else {
+        let archive_for_extract = archive_path.clone();
+        let staging_for_extract = staging.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&archive_for_extract)
+                .map_err(|e| format!("Failed to open Node archive: {e}"))?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            for entry in archive
+                .entries()
+                .map_err(|e| format!("Failed to read Node archive: {e}"))?
+            {
+                let mut entry = entry.map_err(|e| format!("Failed to read Node entry: {e}"))?;
+                let path = entry
+                    .path()
+                    .map_err(|e| format!("Failed to read Node entry path: {e}"))?;
+                let relative = path.components().skip(1).collect::<PathBuf>();
+                if relative.as_os_str().is_empty()
+                    || relative.components().any(|component| {
+                        !matches!(
+                            component,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
+                {
+                    continue;
+                }
+                entry
+                    .unpack(staging_for_extract.join(relative))
+                    .map_err(|e| format!("Failed to extract Node entry: {e}"))?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| format!("Node extraction task failed: {e}"))??;
+        fs::rename(&staging, &target)
+            .await
+            .map_err(|e| format!("Failed to install Node: {e}"))?;
+    }
+
+    let binary = managed_node_binary();
+    if !managed_node_is_usable() {
+        return Err("Stella's managed Node runtime was incomplete.".into());
+    }
+    log_install(
+        install_dir,
+        &format!(
+            "Node {MANAGED_NODE_VERSION} installed to {}",
+            target.to_string_lossy()
+        ),
+    )
+    .await;
+    Ok(binary)
+}
+
+async fn ensure_node_runtime(
+    client: &reqwest::Client,
+    install_dir: &str,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<PathBuf, String> {
+    if let Some(system) = system_node_binary() {
+        log_install(
+            install_dir,
+            &format!("Using existing Node at {}", system.to_string_lossy()),
+        )
+        .await;
+        return Ok(system);
+    }
+    if managed_node_is_usable() {
+        return Ok(managed_node_binary());
+    }
+    install_managed_node(client, install_dir, state, app).await
+}
+
+async fn ensure_uv_runtime(client: &reqwest::Client, install_dir: &str) -> Result<PathBuf, String> {
+    if let Some(system) = usable_executable_on_path(
+        if cfg!(target_os = "windows") {
+            "uv.exe"
+        } else {
+            "uv"
+        },
+        &["--version"],
+    ) {
+        return Ok(system);
+    }
+    let managed = managed_uv_binary();
+    if command_succeeds(&managed, &["--version"]) {
+        return Ok(managed);
+    }
+
+    fs::create_dir_all(stella_private_bin_dir())
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's private bin directory: {e}"))?;
+    let installer_url = if cfg!(target_os = "windows") {
+        format!("https://astral.sh/uv/{MANAGED_UV_VERSION}/install.ps1")
+    } else {
+        format!("https://astral.sh/uv/{MANAGED_UV_VERSION}/install.sh")
+    };
+    let installer = fetch_required_text(client, &installer_url).await?;
+    let installer_path =
+        stella_data_dir()
+            .join("cache")
+            .join("launcher")
+            .join(if cfg!(target_os = "windows") {
+                "install-uv.ps1"
+            } else {
+                "install-uv.sh"
+            });
+    if let Some(parent) = installer_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to prepare uv installer cache: {e}"))?;
+    }
+    fs::write(&installer_path, installer)
+        .await
+        .map_err(|e| format!("Failed to cache uv installer: {e}"))?;
+
+    let mut command = if cfg!(target_os = "windows") {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            installer_path.to_string_lossy().as_ref(),
+        ]);
+        #[cfg(target_os = "windows")]
+        {
+            command.creation_flags(0x08000000);
+        }
+        command
+    } else {
+        let mut command = Command::new("sh");
+        command.arg(&installer_path);
+        command
+    };
+    command
+        .env("UV_UNMANAGED_INSTALL", stella_private_bin_dir())
+        .env("UV_NO_MODIFY_PATH", "1");
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Failed to install uv: {e}"))?;
+    if !output.status.success() || !command_succeeds(&managed, &["--version"]) {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "uv installation did not produce a usable binary.".into()
+        } else {
+            format!("Failed to install uv: {detail}")
+        });
+    }
+    log_install(
+        install_dir,
+        &format!("uv installed to {}", managed.to_string_lossy()),
+    )
+    .await;
+    Ok(managed)
+}
+
+async fn ensure_python_command_shims(python: &Path) -> Result<(), String> {
+    if python.parent() == Some(stella_private_bin_dir().as_path()) {
+        return Ok(());
+    }
+    fs::create_dir_all(stella_private_bin_dir())
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's private bin directory: {e}"))?;
+    if cfg!(target_os = "windows") {
+        for name in ["python.cmd", "python3.cmd"] {
+            let content = format!("@echo off\r\n\"{}\" %*\r\n", python.to_string_lossy());
+            fs::write(stella_private_bin_dir().join(name), content)
+                .await
+                .map_err(|e| format!("Failed to create {name}: {e}"))?;
+        }
+    } else {
+        for name in ["python", "python3"] {
+            let path = stella_private_bin_dir().join(name);
+            let content = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", python.to_string_lossy());
+            fs::write(&path, content)
+                .await
+                .map_err(|e| format!("Failed to create {name}: {e}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = fs::metadata(&path)
+                    .await
+                    .map_err(|e| format!("Failed to inspect {name}: {e}"))?
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&path, permissions)
+                    .await
+                    .map_err(|e| format!("Failed to make {name} executable: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_python_runtime(
+    client: &reqwest::Client,
+    install_dir: &str,
+    state: &mut InstallerState,
+    app: &AppHandle,
+) -> Result<PathBuf, String> {
+    if let Some(system) = python_command_names()
+        .iter()
+        .find_map(|name| executable_on_path(name).filter(|path| python_version_is_usable(path)))
+    {
+        ensure_python_command_shims(&system).await?;
+        log_install(
+            install_dir,
+            &format!("Using existing Python at {}", system.to_string_lossy()),
+        )
+        .await;
+        return Ok(system);
+    }
+    if let Some(managed) = python_command_names().iter().find_map(|name| {
+        let candidate = stella_private_bin_dir().join(name);
+        python_version_is_usable(&candidate).then_some(candidate)
+    }) {
+        ensure_python_command_shims(&managed).await?;
+        return Ok(managed);
+    }
+
+    set_step_progress(
+        state,
+        app,
+        &SetupStepId::Runtime,
+        "Installing Stella's managed Python runtime",
+        Some(0.6),
+    );
+    let uv = ensure_uv_runtime(client, install_dir).await?;
+    fs::create_dir_all(managed_python_install_dir())
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's Python runtime: {e}"))?;
+    fs::create_dir_all(stella_private_bin_dir())
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's private bin directory: {e}"))?;
+    let mut command = Command::new(&uv);
+    command
+        .args(["python", "install", MANAGED_PYTHON_VERSION, "--default"])
+        .env("UV_PYTHON_INSTALL_DIR", managed_python_install_dir())
+        .env("UV_PYTHON_BIN_DIR", stella_private_bin_dir())
+        .env("UV_CACHE_DIR", stella_data_dir().join("cache").join("uv"));
+    #[cfg(target_os = "windows")]
+    {
+        command.creation_flags(0x08000000);
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("Failed to install Python: {e}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "Python installation failed.".into()
+        } else {
+            format!("Python installation failed: {detail}")
+        });
+    }
+    let python = python_command_names()
+        .iter()
+        .find_map(|name| {
+            let candidate = stella_private_bin_dir().join(name);
+            python_version_is_usable(&candidate).then_some(candidate)
+        })
+        .ok_or_else(|| "Python installation did not produce python/python3 shims.".to_string())?;
+    ensure_python_command_shims(&python).await?;
+    log_install(
+        install_dir,
+        &format!(
+            "Python installed to {}",
+            managed_python_install_dir().to_string_lossy()
+        ),
+    )
+    .await;
+    Ok(python)
+}
+
+async fn prepare_git_runtime(
+    client: &reqwest::Client,
+    install_dir: &str,
+    state: &mut InstallerState,
+    app: &AppHandle,
+    step_id: SetupStepId,
+) -> Result<GitRuntime, String> {
+    if let Some(system) = system_git_runtime() {
+        log_install(
+            install_dir,
+            &format!("Using existing Git at {}", system.bin.to_string_lossy()),
+        )
+        .await;
+        return Ok(system);
+    }
+
+    if let Some(managed) = managed_git_runtime() {
+        log_install(
+            install_dir,
+            &format!(
+                "Using Stella's managed Git at {}",
+                managed.bin.to_string_lossy()
+            ),
+        )
+        .await;
+        return Ok(managed);
+    }
+
+    let manifest_url = git_runtime_manifest_url();
+    log_install(
+        install_dir,
+        &format!("Resolving Git runtime manifest: {manifest_url}"),
+    )
+    .await;
+    let manifest_text = fetch_required_text(client, &manifest_url).await?;
+    let manifest = serde_json::from_str::<ManagedGitManifest>(&manifest_text)
+        .map_err(|e| format!("Git runtime manifest was invalid JSON: {e}"))?;
+    let asset = resolve_managed_git_asset(manifest)?;
+    let cache_dir = managed_git_dir();
+    let archive_path = managed_git_archive_path(&asset);
+    let git_root = managed_git_root();
+    let git_bin = git_bin_of_root(&git_root);
+
+    if path_exists(&git_bin).await && managed_git_runtime().is_some() {
+        return managed_git_runtime()
+            .ok_or_else(|| "Stella's managed Git runtime was invalid.".to_string());
+    }
+
+    fs::create_dir_all(&cache_dir)
+        .await
+        .map_err(|e| format!("Failed to prepare Stella's Git cache: {e}"))?;
+    set_step_progress(
+        state,
+        app,
+        &step_id,
+        "Preparing Stella's managed Git",
+        Some(0.04),
+    );
+    download_archive_with_resume(
+        client,
+        &asset.url,
+        &archive_path,
+        Some(asset.size),
+        Some(&asset.sha256),
+        install_dir,
+        state,
+        app,
+        step_id,
         "Git",
         0.04,
         0.12,
@@ -1678,7 +2458,7 @@ async fn prepare_portable_git(
     remove_path_if_present(&git_root).await?;
     fs::create_dir_all(&git_root)
         .await
-        .map_err(|e| format!("Failed to prepare Stella's private Git runtime: {e}"))?;
+        .map_err(|e| format!("Failed to prepare Stella's managed Git runtime: {e}"))?;
     let archive_for_extract = archive_path.clone();
     let root_for_extract = git_root.clone();
     tokio::task::spawn_blocking(move || {
@@ -1702,37 +2482,28 @@ async fn prepare_portable_git(
     .map_err(|e| format!("Git extraction task failed: {e}"))??;
 
     if !path_exists(&git_bin).await {
-        return Err("Stella's private Git runtime was incomplete.".into());
-    }
-    let version_args = vec!["--version".to_string()];
-    let version_output = run_private_git(&git_root, None, &version_args).await?;
-    if !version_output.status.success() {
-        return Err(git_output_error(
-            "Validating Stella's private Git runtime",
-            &version_output,
-        ));
+        return Err("Stella's managed Git runtime was incomplete.".into());
     }
     log_install(
         install_dir,
         &format!(
-            "Prepared checksum-verified private Git runtime at {}",
+            "Prepared checksum-verified managed Git runtime at {}",
             git_root.to_string_lossy()
         ),
     )
     .await;
-    Ok(git_root)
+    managed_git_runtime().ok_or_else(|| "Stella's managed Git runtime was invalid.".to_string())
 }
 
-async fn run_private_git(
-    git_root: &Path,
+async fn run_git_runtime(
+    git: &GitRuntime,
     cwd: Option<&Path>,
     args: &[String],
 ) -> Result<std::process::Output, String> {
-    let git_bin = git_bin_of_root(git_root);
-    let mut command = Command::new(&git_bin);
+    let mut command = Command::new(&git.bin);
     command
         .args(args)
-        .envs(private_git_env(git_root))
+        .envs(&git.env)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1");
     if let Some(cwd) = cwd {
@@ -1740,13 +2511,12 @@ async fn run_private_git(
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt as _;
         command.creation_flags(0x08000000);
     }
     command
         .output()
         .await
-        .map_err(|e| format!("Could not run Stella's private Git: {e}"))
+        .map_err(|e| format!("Could not run Git: {e}"))
 }
 
 fn git_output_error(action: &str, output: &std::process::Output) -> String {
@@ -1760,12 +2530,12 @@ fn git_output_error(action: &str, output: &std::process::Output) -> String {
     }
 }
 
-async fn git_stdout(git_root: &Path, cwd: &Path, args: &[&str]) -> Result<String, String> {
+async fn git_stdout(git: &GitRuntime, cwd: &Path, args: &[&str]) -> Result<String, String> {
     let owned = args
         .iter()
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
-    let output = run_private_git(git_root, Some(cwd), &owned).await?;
+    let output = run_git_runtime(git, Some(cwd), &owned).await?;
     if !output.status.success() {
         return Err(git_output_error("Git inspection", &output));
     }
@@ -1794,7 +2564,7 @@ async fn move_clone_into_install(clone_dir: &Path, install_dir: &Path) -> Result
 
 async fn clone_release_source(
     release: &ResolvedDesktopRelease,
-    git_root: &Path,
+    git: &GitRuntime,
     install_dir: &str,
     state: &mut InstallerState,
     app: &AppHandle,
@@ -1802,7 +2572,7 @@ async fn clone_release_source(
     let install_path = Path::new(install_dir);
     let existing_git = install_path.join(".git");
     if path_exists(&existing_git).await {
-        let existing_head = git_stdout(git_root, install_path, &["rev-parse", "HEAD"]).await?;
+        let existing_head = git_stdout(git, install_path, &["rev-parse", "HEAD"]).await?;
         if existing_head == release.commit {
             log_install(
                 install_dir,
@@ -1834,7 +2604,7 @@ async fn clone_release_source(
         STELLA_GITHUB_REMOTE_URL.into(),
         clone_dir.to_string_lossy().to_string(),
     ];
-    let clone_output = run_private_git(git_root, None, &clone_args).await?;
+    let clone_output = run_git_runtime(git, None, &clone_args).await?;
     if !clone_output.status.success() {
         return Err(git_output_error("Cloning Stella", &clone_output));
     }
@@ -1853,7 +2623,7 @@ async fn clone_release_source(
         "master".into(),
         release.commit.clone(),
     ];
-    let checkout_output = run_private_git(git_root, Some(&clone_dir), &checkout_args).await?;
+    let checkout_output = run_git_runtime(git, Some(&clone_dir), &checkout_args).await?;
     if !checkout_output.status.success() {
         return Err(git_output_error(
             "Checking out the Stella release",
@@ -1861,7 +2631,7 @@ async fn clone_release_source(
         ));
     }
 
-    let remote_head = git_stdout(git_root, &clone_dir, &["rev-parse", "origin/master"]).await?;
+    let remote_head = git_stdout(git, &clone_dir, &["rev-parse", "origin/master"]).await?;
     if remote_head != release.commit {
         return Err(format!(
             "Published Stella commit {} did not match origin/master {}.",
@@ -1873,7 +2643,7 @@ async fn clone_release_source(
         "--set-upstream-to=origin/master".into(),
         "master".into(),
     ];
-    let upstream_output = run_private_git(git_root, Some(&clone_dir), &upstream_args).await?;
+    let upstream_output = run_git_runtime(git, Some(&clone_dir), &upstream_args).await?;
     if !upstream_output.status.success() {
         return Err(git_output_error(
             "Configuring Stella's update branch",
@@ -1882,12 +2652,12 @@ async fn clone_release_source(
     }
 
     move_clone_into_install(&clone_dir, install_path).await?;
-    let installed_head = git_stdout(git_root, install_path, &["rev-parse", "HEAD"]).await?;
+    let installed_head = git_stdout(git, install_path, &["rev-parse", "HEAD"]).await?;
     if installed_head != release.commit {
         return Err("Installed Stella clone did not retain the published commit.".into());
     }
     let partial_filter = git_stdout(
-        git_root,
+        git,
         install_path,
         &["config", "--get", "remote.origin.partialclonefilter"],
     )
@@ -1896,7 +2666,7 @@ async fn clone_release_source(
         return Err("Installed Stella clone did not retain blobless history.".into());
     }
     let status = git_stdout(
-        git_root,
+        git,
         install_path,
         &["status", "--porcelain", "--untracked-files=all"],
     )
@@ -1958,8 +2728,8 @@ async fn download_and_clone_release(
         Some(0.02),
     );
     let release = resolve_r2_desktop_release(&client, install_dir).await?;
-    let git_root = prepare_portable_git(&client, install_dir, state, app).await?;
-    clone_release_source(&release, &git_root, install_dir, state, app).await?;
+    let git = prepare_git_runtime(&client, install_dir, state, app, SetupStepId::Payload).await?;
+    clone_release_source(&release, &git, install_dir, state, app).await?;
     write_cloned_release_manifest(install_dir, &release).await?;
 
     log_install(
@@ -2652,12 +3422,15 @@ fn git_config_value_missing(output: &std::process::Output) -> bool {
 /// or repairs repository history.
 async fn configure_cloned_git_identity(install_dir: &str) {
     let git_dir = Path::new(install_dir).join(".git");
-    let git_bin = dugite_git_bin_of(install_dir);
-    if !path_exists(&git_dir).await || !path_exists(&git_bin).await {
+    let Some(git) = available_git_runtime() else {
+        return;
+    };
+    if !path_exists(&git_dir).await {
         return;
     }
 
-    let env = dugite_launch_env(install_dir);
+    let git_bin = git.bin;
+    let env = git.env;
     let cwd = PathBuf::from(install_dir);
     let (git_user_name, git_user_email) = install_git_identity(install_dir);
 
@@ -2796,7 +3569,11 @@ async fn check_step(id: &SetupStepId, state: &InstallerState) -> StepCheck {
     let dir = &state.install_path;
     match id {
         SetupStepId::Runtime => {
-            if bun_on_path().await {
+            if bun_on_path().await
+                && available_git_runtime().is_some()
+                && available_node_binary().is_some()
+                && available_python_binary().is_some()
+            {
                 StepCheck::complete()
             } else {
                 StepCheck::incomplete_silent()
@@ -2882,14 +3659,16 @@ async fn install_step(
     let dir = state.install_path.clone();
     match id {
         SetupStepId::Runtime => {
-            if bun_on_path().await {
-                return Ok(());
+            if !bun_on_path().await && !install_bun_globally().await {
+                return Err(
+                    "Failed to install Bun runtime. Check your internet connection.".into(),
+                );
             }
-            if install_bun_globally().await {
-                Ok(())
-            } else {
-                Err("Failed to install Bun runtime. Check your internet connection.".into())
-            }
+            let client = download_client()?;
+            prepare_git_runtime(&client, &dir, state, app, SetupStepId::Runtime).await?;
+            ensure_node_runtime(&client, &dir, state, app).await?;
+            ensure_python_runtime(&client, &dir, state, app).await?;
+            Ok(())
         }
         SetupStepId::Payload => {
             let _ = fs::create_dir_all(&dir).await;
@@ -2904,12 +3683,9 @@ async fn install_step(
                 Some(0.8),
             );
             install_payload_dependencies(&dir, state, app).await?;
-            if !path_exists(&dugite_git_bin_of(&dir)).await {
-                return Err(
-                    "Stella's installed Git runtime was missing after dependency setup.".into(),
-                );
+            if available_git_runtime().is_none() {
+                return Err("Stella's Git runtime was missing after dependency setup.".into());
             }
-            let _ = remove_path_if_present(&portable_git_root()).await;
             Ok(())
         }
         SetupStepId::Parakeet => {
@@ -3247,7 +4023,7 @@ pub async fn get_launch_info(state: &InstallerState) -> Option<LaunchInfo> {
         let _ = ensure_ripgrep_provisioned(dir).await;
     }
 
-    let mut env = dugite_launch_env(dir);
+    let mut env = runtime_launch_env(dir);
     if let Ok(exe) = std::env::current_exe() {
         env.insert(
             "STELLA_LAUNCHER_PROTECTED_STORAGE_BIN".into(),
@@ -3404,7 +4180,7 @@ mod tests {
     #[test]
     fn launch_env_prepends_stella_private_bin() {
         let dir = TestDir::new("launch-env-bin");
-        let env = dugite_launch_env(&dir.path.to_string_lossy());
+        let env = runtime_launch_env(&dir.path.to_string_lossy());
         let path_value = env.get("PATH").expect("PATH env");
         let first_entry = path_value
             .split(path_separator())
@@ -3638,22 +4414,16 @@ mod tests {
     }
 
     #[test]
-    fn launch_env_prepends_bun_bin_even_without_dugite() {
+    fn launch_env_includes_private_and_bun_bins() {
         let dir = TestDir::new("launch-env");
-        let env = dugite_launch_env(&dir.path.to_string_lossy());
+        let env = runtime_launch_env(&dir.path.to_string_lossy());
         let path = env.get("PATH").expect("PATH env");
-        let entries = path
-            .split(path_separator())
-            .take(2)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let entries = path.split(path_separator()).collect::<Vec<_>>();
         assert_eq!(
-            entries,
-            vec![
-                stella_private_bin_dir().to_string_lossy().to_string(),
-                bun_bin_dir().to_string_lossy().to_string()
-            ]
+            entries.first().copied(),
+            Some(stella_private_bin_dir().to_string_lossy().as_ref())
         );
+        assert!(entries.contains(&bun_bin_dir().to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -3673,14 +4443,49 @@ mod tests {
     }
 
     #[test]
-    fn portable_git_asset_matches_dugite_cache_contract() {
-        let asset = portable_git_asset().expect("supported test platform");
-        assert!(asset.file_name.starts_with("dugite-native-v2.53.0-"));
+    fn managed_git_manifest_resolves_checksum_pinned_platform_asset() {
+        let platform = managed_runtime_platform_key().expect("supported test platform");
+        let file_name = format!("stella-git-{platform}.tar.gz");
+        let raw = format!(
+            r#"{{
+                "schemaVersion": 1,
+                "version": "{MANAGED_GIT_VERSION}",
+                "assets": {{
+                    "{platform}": {{
+                        "fileName": "{file_name}",
+                        "url": "https://cdn.test/git-runtime/objects/runtime.tar.gz",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "size": 123
+                    }}
+                }}
+            }}"#
+        );
+        let manifest =
+            serde_json::from_str::<ManagedGitManifest>(&raw).expect("managed Git manifest");
+        let asset = resolve_managed_git_asset(manifest).expect("managed Git asset");
+
+        assert_eq!(asset.file_name, file_name);
+        assert!(asset.url.starts_with("https://"));
+        assert_eq!(asset.sha256.len(), 64);
+        assert!(asset.sha256.chars().all(|char| char.is_ascii_hexdigit()));
+        assert_eq!(asset.size, 123);
+        assert!(managed_git_archive_path(&asset).ends_with(&asset.file_name));
+        assert!(
+            git_runtime_manifest_url().ends_with(&format!("/{MANAGED_GIT_VERSION}/manifest.json"))
+        );
+    }
+
+    #[test]
+    fn managed_node_asset_is_checksum_pinned() {
+        let asset = managed_node_asset().expect("supported test platform");
+        assert!(asset
+            .file_name
+            .starts_with(&format!("node-v{MANAGED_NODE_VERSION}-")));
         assert!(asset.url.ends_with(asset.file_name));
         assert_eq!(asset.sha256.len(), 64);
         assert!(asset.sha256.chars().all(|char| char.is_ascii_hexdigit()));
-        assert!(portable_git_archive_path()
-            .expect("portable Git archive path")
+        assert!(managed_node_archive_path()
+            .expect("managed Node archive path")
             .ends_with(asset.file_name));
     }
 
@@ -3688,9 +4493,7 @@ mod tests {
     fn identity_setup_never_synthesizes_missing_git_history() {
         let dir = TestDir::new("missing-clone-history");
 
-        tauri::async_runtime::block_on(configure_cloned_git_identity(
-            &dir.path.to_string_lossy(),
-        ));
+        tauri::async_runtime::block_on(configure_cloned_git_identity(&dir.path.to_string_lossy()));
 
         assert!(!dir.path.join(".git").exists());
     }

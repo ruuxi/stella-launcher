@@ -732,7 +732,7 @@ fn read_log_tail(log_path: &Path, line_limit: usize) -> String {
 /// base commit, etc.) the launcher should NOT offer to roll it back, so
 /// we return `None` and the recovery view hides the undo button.
 fn latest_revertable_commit(install_path: &str) -> Option<RevertableCommit> {
-    let env = setup::dugite_launch_env(install_path);
+    let env = setup::runtime_launch_env(install_path);
     let git_bin = env.get("STELLA_GIT_BIN")?.clone();
     let mut cmd = StdCommand::new(&git_bin);
     cmd.current_dir(install_path)
@@ -1135,11 +1135,11 @@ pub async fn revert_last_self_mod(state: State<'_, AppState>) -> Result<OkResult
         "The latest commit isn't a Stella self-mod, so there's nothing safe to roll back automatically. Reinstall Stella to start fresh.".to_string()
     })?;
 
-    let env = setup::dugite_launch_env(&install_path);
+    let env = setup::runtime_launch_env(&install_path);
     let git_bin = env
         .get("STELLA_GIT_BIN")
         .cloned()
-        .ok_or_else(|| "Bundled git not found.".to_string())?;
+        .ok_or_else(|| "Git runtime not found.".to_string())?;
 
     let install_path_for_blocking = install_path.clone();
     let env_for_blocking = env.clone();
