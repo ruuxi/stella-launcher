@@ -14,7 +14,7 @@ import type {
   RevertableCommit,
   SetupStep,
 } from "./types";
-import stellaLogo from "./stella-logo.svg";
+import stellaLogo from "./stella-logo.png";
 
 /* ── In-app confirmation dialog ──────────────────────────────────── */
 
